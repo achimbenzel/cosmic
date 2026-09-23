@@ -79,13 +79,22 @@ enum ParamId {
     kIdWorkingSpace = 63,
     kIdCompositeGroupEnd = 64,
     kIdAboutGroup = 65,
-    kIdAboutGroupEnd = 66
+    kIdAboutGroupEnd = 66,
+    // v1.1
+    kIdPerformanceGroup = 67,
+    kIdGpu = 68,
+    kIdPerformanceGroupEnd = 69
 };
 
-static_assert(kParamCount == 67, "parameters may only be appended");
+static_assert(kParamCount == 70, "parameters may only be appended");
 static_assert(kParamColor5 - kParamColor1 == kStopCount - 1, "one colour control per palette stop");
 static_assert(kParamWorkingSpace == 63 && kIdWorkingSpace == 63, "layout of the first release");
 static_assert(kParamAboutGroupEnd == 66 && kIdAboutGroupEnd == 66, "layout of the first release");
+static_assert(kParamDepthShape == 22 && kIdDepthShape == 22 && kParamLoopWithAngle == 32 &&
+                  kIdLoopWithAngle == 32,
+              "layout of the first release");
+static_assert(kParamGpu == 68 && kIdGpu == 68 && kParamPerformanceGroupEnd == 69 && kIdPerformanceGroupEnd == 69,
+              "layout of v1.1");
 
 // Popup strings. Their order is the enums' order in CosmicPipeline.h and
 // Palette.h, so it is part of the project format too: append only.
@@ -93,7 +102,8 @@ constexpr char kColorBlendChoices[] = "Oklab Smooth|Oklab|Linear Light|sRGB";
 constexpr char kTypeChoices[] = "Linear|Radial|Conic|Diamond|Reflected";
 constexpr char kFitChoices[] = "Content Bounds|Layer";
 constexpr char kRepeatChoices[] = "None|Repeat|Mirror";
-constexpr char kDepthShapeChoices[] = "Dome|Sphere|Ridge|Wave";
+// "Bulge" was appended in v1.1; the first four keep their v1.0 positions.
+constexpr char kDepthShapeChoices[] = "Dome|Sphere|Ridge|Wave|Bulge";
 constexpr char kMatteChoices[] = "Layer Alpha|Inverted Alpha|Full Frame";
 constexpr char kBlendChoices[] = "Normal|Multiply|Screen|Overlay|Color";
 constexpr char kWorkingSpaceChoices[] = "Auto|Linear|sRGB";
@@ -213,7 +223,7 @@ PF_Err SetupParams(PF_InData* in_data, PF_OutData* out_data) {
 
     // --- Depth ---------------------------------------------------------------
     PF_ADD_TOPICX("Depth", 0, kIdDepthGroup);
-    PF_ADD_POPUPX("Depth Shape", 4, d.depth_shape, kDepthShapeChoices, 0, kIdDepthShape);
+    PF_ADD_POPUPX("Depth Shape", 5, d.depth_shape, kDepthShapeChoices, 0, kIdDepthShape);
     PF_ADD_FLOAT_SLIDERX("Depth", -1000.0f, 1000.0f, -100.0f, 100.0f, d.depth_pct, PF_Precision_TENTHS,
                          PF_ValueDisplayFlag_PERCENT, 0, kIdDepth);
     AEFX_CLR_STRUCT(def);
@@ -309,6 +319,13 @@ PF_Err SetupParams(PF_InData* in_data, PF_OutData* out_data) {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(kIdAboutGroupEnd);
 
+    // --- Performance (v1.1, appended after the v1.0 layout) -----------------
+    PF_ADD_TOPICX("Performance", PF_ParamFlag_START_COLLAPSED, kIdPerformanceGroup);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("GPU Acceleration", d.gpu ? TRUE : FALSE, 0, kIdGpu);
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(kIdPerformanceGroupEnd);
+
     out_data->num_params = kParamCount;
     return PF_Err_NONE;
 }
@@ -367,6 +384,7 @@ PF_Err ReadParams(PF_InData* in_data, EffectParams* out_params) {
     if (!err) err = ReadFloat(in_data, kParamOpacity, &ui.opacity_pct);
     if (!err) err = ReadCheckbox(in_data, kParamExpandBounds, &ui.expand_bounds);
     if (!err) err = ReadPopup(in_data, kParamWorkingSpace, &ui.working_space);
+    if (!err) err = ReadCheckbox(in_data, kParamGpu, &ui.gpu);
     if (err) return err;
 
     // The layer's own size, before any effect or downsampling: the frame the
@@ -378,6 +396,7 @@ PF_Err ReadParams(PF_InData* in_data, EffectParams* out_params) {
 
     EffectParams params;
     params.settings = SettingsFromUi(ui, layer_width, layer_height, frame);
+    params.gpu = ui.gpu;
     params.expand_bounds = ui.expand_bounds;
     params.animate_grain = ui.animate_grain;
     params.grain = ui.grain_pct;

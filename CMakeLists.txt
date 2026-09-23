@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(CosmicGradient VERSION 1.0.0 LANGUAGES CXX)
+project(CosmicGradient VERSION 1.1.0 LANGUAGES CXX)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -33,11 +33,12 @@ set(COSMIC_INSTALL_DIR "" CACHE PATH
 # ---------------------------------------------------------------------------
 add_library(cosmic_core STATIC
     src/core/CosmicPipeline.cpp
-    src/core/Noise.cpp
     src/core/Palette.cpp
+    src/core/Plan.cpp
     src/core/Pyramid.cpp
     src/core/Transfer.cpp
-    src/core/UiModel.cpp)
+    src/core/UiModel.cpp
+    src/gpu/GpuPipeline.cpp)
 
 target_include_directories(cosmic_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
@@ -98,6 +99,7 @@ if(COSMIC_BUILD_PLUGIN)
         src/plugin/CosmicParams.cpp
         src/plugin/CosmicRender.cpp
         src/plugin/AeAdapters.cpp
+        src/plugin/CudaDevice.cpp
         "${COSMIC_GENERATED_DIR}/CosmicGradient_PiPL.rc")
 
     target_link_libraries(CosmicGradient PRIVATE cosmic_core)
@@ -157,6 +159,20 @@ if(COSMIC_BUILD_TESTS)
     add_executable(cosmic_preview tests/PreviewTool.cpp)
     target_link_libraries(cosmic_preview PRIVATE cosmic_test_support)
 
+    # The CUDA kernels, run on the CPU against the CPU renderer.
+    add_library(cosmic_gpu_emulator STATIC tests/GpuEmulator.cpp)
+    target_link_libraries(cosmic_gpu_emulator PUBLIC cosmic_test_support)
+    add_executable(cosmic_gpu_tests tests/GpuTests.cpp)
+    target_link_libraries(cosmic_gpu_tests PRIVATE cosmic_gpu_emulator)
+    add_test(NAME gpu COMMAND cosmic_gpu_tests)
+
+    # The PTX the plug-in embeds must come from the kernels as they are now.
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME ptx_up_to_date
+                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_ptx.py" --check)
+    endif()
+
     # Loads the built .aex and drives the After Effects command sequence.
     if(COSMIC_BUILD_PLUGIN AND WIN32)
         add_executable(cosmic_mock_host tests/MockHost.cpp)
@@ -164,6 +180,13 @@ if(COSMIC_BUILD_TESTS)
         target_include_directories(cosmic_mock_host SYSTEM PRIVATE ${AE_SDK_INCLUDE_DIRS})
         target_compile_definitions(cosmic_mock_host PRIVATE WIN_ENV _WINDOWS MSWindows NOMINMAX WIN32_LEAN_AND_MEAN)
         add_dependencies(cosmic_mock_host CosmicGradient)
-        add_test(NAME plugin COMMAND cosmic_mock_host $<TARGET_FILE:CosmicGradient>)
+
+        # A stand-in nvcuda.dll: the plug-in's CUDA path, with kernels run by
+        # the emulator, so the mock host can drive GPU renders without a GPU.
+        add_library(fake_nvcuda SHARED tests/FakeCuda.cpp)
+        target_link_libraries(fake_nvcuda PRIVATE cosmic_gpu_emulator)
+        set_target_properties(fake_nvcuda PROPERTIES PREFIX "" OUTPUT_NAME "nvcuda")
+        add_dependencies(cosmic_mock_host fake_nvcuda)
+        add_test(NAME plugin COMMAND cosmic_mock_host $<TARGET_FILE:CosmicGradient> "" $<TARGET_FILE:fake_nvcuda>)
     endif()
 endif()

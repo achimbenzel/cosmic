@@ -59,7 +59,7 @@ CosmicSettings SettingsFromUi(const UiValues& ui, float layer_width, float layer
     s.offset = ui.offset_pct * 0.01f;
     s.repeat = PopupToEnum<RepeatMode>(ui.repeat, 3);
 
-    s.depth_shape = PopupToEnum<DepthShape>(ui.depth_shape, 4);
+    s.depth_shape = PopupToEnum<DepthShape>(ui.depth_shape, 5);
     s.depth = ui.depth_pct * 0.01f;
     s.depth_x = ui.depth_x;
     s.depth_y = ui.depth_y;

@@ -8,7 +8,7 @@
 #define COSMIC_DESCRIPTION "Cinematic gradients for shapes and text, with glow and optical diffusion."
 
 #define COSMIC_VERSION_MAJOR 1
-#define COSMIC_VERSION_MINOR 0
+#define COSMIC_VERSION_MINOR 1
 #define COSMIC_VERSION_BUG 0
 #define COSMIC_VERSION_BUILD 1
 

@@ -5,18 +5,15 @@
 #include "Allocator.h"
 #include "Color.h"
 #include "Palette.h"
+#include "Shared.h"
 #include "SourceImage.h"
 #include "TaskRunner.h"
 
 namespace cosmic {
 
 // The numeric values of these enums are the popup indices minus one, so they
-// are part of the saved project format: append only.
-enum class GradientType { kLinear = 0, kRadial = 1, kConic = 2, kDiamond = 3, kReflected = 4 };
-enum class RepeatMode { kNone = 0, kRepeat = 1, kMirror = 2 };
-enum class DepthShape { kDome = 0, kSphere = 1, kRidge = 2, kWave = 3 };
-enum class MatteMode { kLayerAlpha = 0, kInvertedAlpha = 1, kFullFrame = 2 };
-enum class BlendMode { kNormal = 0, kMultiply = 1, kScreen = 2, kOverlay = 3, kColor = 4 };
+// are part of the saved project format: append only. The ones the kernels
+// need are in Shared.h.
 enum class WorkingSpace { kAuto = 0, kLinear = 1, kSrgb = 2 };
 enum class FitMode { kContentBounds = 0, kLayer = 1 };
 
@@ -116,7 +113,7 @@ struct CosmicRender {
     float blur_scale = 1.0f;
 };
 
-enum class CosmicResult { kOk, kOutOfMemory, kInvalidArguments };
+enum class CosmicResult { kOk, kOutOfMemory, kInvalidArguments, kDeviceError };
 
 // How far, in render pixels, light can travel from the layer: what the output
 // bounds must grow by so nothing is clipped.

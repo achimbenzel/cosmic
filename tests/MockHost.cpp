@@ -9,7 +9,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,6 +27,8 @@
 #include "AE_Effect.h"
 #include "AE_EffectCB.h"
 #include "AE_EffectCBSuites.h"
+#include "AE_EffectGPUSuites.h"
+#include "AE_EffectPixelFormat.h"
 #include "AE_EffectSuites.h"
 #include "AE_Macros.h"
 #if defined(__GNUC__) || defined(__clang__)
@@ -58,6 +62,8 @@ enum {
     kIndexColor5 = 7,
     kIndexType = 12,
     kIndexFit = 13,
+    kIndexDepthShape = 22,
+    kIndexLoopWithAngle = 32,
     kIndexDefocus = 39,
     kIndexGlowIntensity = 42,
     kIndexGlowRadius = 43,
@@ -65,13 +71,15 @@ enum {
     kIndexAnimateGrain = 56,
     kIndexMatte = 59,
     kIndexExpandBounds = 62,
-    kParamCountAsShipped = 67
+    kIndexGpu = 68,
+    kParamCountV10 = 67,  // the layout v1.0 shipped with; v1.1 only appends
+    kParamCount = 70
 };
 
 constexpr A_long kExpectedOutFlags = PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_NON_PARAM_VARY;
 constexpr A_long kExpectedOutFlags2 = PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG | PF_OutFlag2_SUPPORTS_SMART_RENDER |
                                       PF_OutFlag2_FLOAT_COLOR_AWARE | PF_OutFlag2_SUPPORTS_THREADED_RENDERING |
-                                      PF_OutFlag2_SUPPORTS_QUERY_DYNAMIC_FLAGS;
+                                      PF_OutFlag2_SUPPORTS_QUERY_DYNAMIC_FLAGS | PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
 
 // ---------------------------------------------------------------------------
 // Host state
@@ -186,7 +194,71 @@ PF_Err MockIterateGeneric(A_long iterations, void* refcon, PF_Err (*fn)(void*, A
 
 PF_Iterate8Suite1 g_iterate_suite = {};
 
+// --- GPU: device memory is host memory; the fake nvcuda.dll runs kernels on it.
+
+std::map<const PF_EffectWorld*, void*> g_gpu_world_data;  // GPU worlds' pixels
+std::map<void*, std::size_t> g_device_live;
+int g_device_allocations = 0;
+
+PF_Err MockGetDeviceCount(PF_ProgPtr, A_u_long* count) {
+    *count = 1;
+    return PF_Err_NONE;
+}
+
+PF_Err MockGetDeviceInfo(PF_ProgPtr, A_u_long, PF_GPUDeviceInfo* info) {
+    std::memset(info, 0, sizeof(*info));
+    info->device_framework = PF_GPU_Framework_CUDA;
+    info->compatibleB = TRUE;
+    info->contextPV = reinterpret_cast<void*>(0xC0DE);  // any non-null CUcontext
+    info->command_queuePV = nullptr;                    // the default stream
+    return PF_Err_NONE;
+}
+
+PF_Err MockAllocateDeviceMemory(PF_ProgPtr, A_u_long, size_t bytes, void** memory) {
+    void* block = std::malloc(bytes);
+    if (block == nullptr) return PF_Err_OUT_OF_MEMORY;
+    std::memset(block, 0xFF, bytes);  // garbage, as real device memory holds
+    g_device_live[block] = bytes;
+    ++g_device_allocations;
+    *memory = block;
+    return PF_Err_NONE;
+}
+
+PF_Err MockFreeDeviceMemory(PF_ProgPtr, A_u_long, void* memory) {
+    if (g_device_live.erase(memory) == 0) {
+        std::printf("FAIL: freeing device memory the host never allocated\n");
+        ++g_failures;
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    std::free(memory);
+    return PF_Err_NONE;
+}
+
+PF_Err MockGetGPUWorldData(PF_ProgPtr, PF_EffectWorld* world, void** pixels) {
+    auto it = g_gpu_world_data.find(world);
+    if (it == g_gpu_world_data.end()) return PF_Err_BAD_CALLBACK_PARAM;
+    *pixels = it->second;
+    return PF_Err_NONE;
+}
+
+PF_GPUDeviceSuite1 g_gpu_suite = {};
+
+PF_Err MockGetPixelFormat(const PF_EffectWorld* world, PF_PixelFormat* format) {
+    *format = g_gpu_world_data.count(world) != 0 ? PF_PixelFormat_GPU_BGRA128 : PF_PixelFormat_ARGB128;
+    return PF_Err_NONE;
+}
+
+PF_WorldSuite2 g_world_suite = {};
+
 SPErr MockAcquireSuite(const char* name, int32_t version, const void** suite) {
+    if (std::strcmp(name, kPFGPUDeviceSuite) == 0 && version == kPFGPUDeviceSuiteVersion1) {
+        *suite = &g_gpu_suite;
+        return kSPNoError;
+    }
+    if (std::strcmp(name, kPFWorldSuite) == 0 && version == kPFWorldSuiteVersion2) {
+        *suite = &g_world_suite;
+        return kSPNoError;
+    }
     if (std::strcmp(name, kPFHandleSuite) == 0 && version == kPFHandleSuiteVersion1) {
         *suite = &g_handle_suite;
         return kSPNoError;
@@ -336,7 +408,14 @@ MockHost* NewInstance(EffectMainFn effect_main, PF_InData* in_data, PF_OutData* 
     Check(err == PF_Err_NONE, "params setup succeeds");
     Check(out_data->num_params == static_cast<A_long>(host->params.size()) + 1,
           "reported parameter count matches the parameters added");
-    Check(out_data->num_params == kParamCountAsShipped, "the shipped parameter layout is unchanged");
+    Check(out_data->num_params == kParamCount, "the v1.1 parameter layout");
+    // Saved projects find values by these ids: every id equals its index, the
+    // v1.0 ones unchanged and the new ones appended after them.
+    bool ids_ok = host->params.size() + 1 == static_cast<std::size_t>(kParamCount);
+    for (std::size_t i = 0; i < host->params.size(); ++i) {
+        ids_ok = ids_ok && host->params[i].uu.id == static_cast<A_long>(i + 1);
+    }
+    Check(ids_ok, "parameter ids equal their indices, so v1.0 projects map onto v1.1");
 
     // After Effects turns a point's percentage default into layer pixels
     // when the effect is applied.
@@ -363,9 +442,15 @@ struct RenderOptions {
     float defocus = 0.0f;
     float glow_radius = 80.0f;
     bool animate_grain = false;
+    float turbulence = -1.0f;  // percent; negative keeps the default
+    int depth_shape = 0;       // 0 keeps the default
 };
 
-bool RunRender(EffectMainFn effect_main, const RenderOptions& options, const std::string& out_dir) {
+void ApplyOptions(MockHost* host, const RenderOptions& options);
+void FillTestScene(PF_EffectWorld* world, short bitdepth);
+
+bool RunRender(EffectMainFn effect_main, const RenderOptions& options, const std::string& out_dir,
+               cosmic_test::TestImage* out_image = nullptr, PF_LRect* out_rect = nullptr) {
     PF_InData in_data;
     PF_OutData out_data;
     PF_UtilCallbacks utils;
@@ -375,12 +460,7 @@ bool RunRender(EffectMainFn effect_main, const RenderOptions& options, const std
     in_data.downsample_y.den = options.downsample;
     in_data.current_time = 12;
 
-    Param(host, kIndexExpandBounds).u.bd.value = options.expand_bounds ? TRUE : FALSE;
-    Param(host, kIndexMatte).u.pd.value = options.matte;
-    Param(host, kIndexType).u.pd.value = options.type;
-    Param(host, kIndexDefocus).u.fs_d.value = options.defocus;
-    Param(host, kIndexGlowRadius).u.fs_d.value = options.glow_radius;
-    Param(host, kIndexAnimateGrain).u.bd.value = options.animate_grain ? TRUE : FALSE;
+    ApplyOptions(host, options);
 
     const int w = options.width / options.downsample;
     const int h = options.height / options.downsample;
@@ -452,10 +532,294 @@ bool RunRender(EffectMainFn effect_main, const RenderOptions& options, const std
     }
 
     if (!out_dir.empty()) cosmic_test::WritePng(out_dir + "/mockhost_" + options.label + ".png", image);
+    if (out_image != nullptr) {
+        out_image->Resize(image.View().width, image.View().height, depth);
+        std::memcpy(out_image->View().data, image.View().data,
+                    static_cast<std::size_t>(image.View().rowbytes) * image.View().height);
+    }
+    if (out_rect != nullptr) *out_rect = pre_output.result_rect;
 
     g_host = nullptr;
     delete host;
     return true;
+}
+
+void ApplyOptions(MockHost* host, const RenderOptions& options) {
+    Param(host, kIndexExpandBounds).u.bd.value = options.expand_bounds ? TRUE : FALSE;
+    Param(host, kIndexMatte).u.pd.value = options.matte;
+    Param(host, kIndexType).u.pd.value = options.type;
+    Param(host, kIndexDefocus).u.fs_d.value = options.defocus;
+    Param(host, kIndexGlowRadius).u.fs_d.value = options.glow_radius;
+    Param(host, kIndexAnimateGrain).u.bd.value = options.animate_grain ? TRUE : FALSE;
+    if (options.turbulence >= 0.0f) Param(host, 28).u.fs_d.value = options.turbulence;
+    if (options.depth_shape > 0) Param(host, kIndexDepthShape).u.pd.value = options.depth_shape;
+}
+
+// ---------------------------------------------------------------------------
+// GPU
+// ---------------------------------------------------------------------------
+
+using FakeStatsFn = void (*)(int*, int*, int*, int*);
+using FakeFailFn = void (*)(int);
+FakeStatsFn g_fake_stats = nullptr;
+FakeFailFn g_fake_fail = nullptr;
+
+// Renders one frame through GPU_DEVICE_SETUP, SMART_PRE_RENDER and
+// SMART_RENDER_GPU on 32-bit float GPU frames. Returns the frame as ARGB.
+bool RunGpuRender(EffectMainFn effect_main, const RenderOptions& options, bool gpu_checkbox,
+                  cosmic_test::TestImage* out_image, PF_LRect* out_rect) {
+    PF_InData in_data;
+    PF_OutData out_data;
+    PF_UtilCallbacks utils;
+    MockHost* host = NewInstance(effect_main, &in_data, &out_data, &utils, options.width, options.height);
+    host->downsample = options.downsample;
+    in_data.downsample_x.den = options.downsample;
+    in_data.downsample_y.den = options.downsample;
+    in_data.current_time = 12;
+    ApplyOptions(host, options);
+    Param(host, kIndexGpu).u.bd.value = gpu_checkbox ? TRUE : FALSE;
+    const std::string label = "gpu " + options.label;
+
+    // Device setup: the kernels load into the (fake) CUDA context.
+    PF_GPUDeviceSetupInput setup_in = {PF_GPU_Framework_CUDA, 0};
+    PF_GPUDeviceSetupOutput setup_out = {nullptr};
+    PF_GPUDeviceSetupExtra setup = {&setup_in, &setup_out};
+    out_data.out_flags2 = 0;
+    PF_Err err = effect_main(PF_Cmd_GPU_DEVICE_SETUP, &in_data, &out_data, nullptr, nullptr, &setup);
+    Check(err == PF_Err_NONE, label + ": GPU device setup succeeds");
+    Check(setup_out.gpu_data != nullptr, label + ": the CUDA device is accepted");
+    Check((out_data.out_flags2 & PF_OutFlag2_SUPPORTS_GPU_RENDER_F32) != 0, label + ": and GPU rendering is claimed");
+
+    const int w = options.width / options.downsample;
+    const int h = options.height / options.downsample;
+    host->layer_rect = PF_LRect{0, 0, w, h};
+
+    PF_PreRenderInput pre_input = {};
+    pre_input.bitdepth = 32;
+    pre_input.output_request.rect = host->layer_rect;
+    pre_input.output_request.field = PF_Field_FRAME;
+    pre_input.output_request.channel_mask = PF_ChannelMask_ARGB;
+    pre_input.gpu_data = setup_out.gpu_data;
+    pre_input.what_gpu = PF_GPU_Framework_CUDA;
+    pre_input.device_index = 0;
+    PF_PreRenderOutput pre_output = {};
+    PF_PreRenderCallbacks pre_callbacks = {MockCheckoutLayer, MockGuidMixInPtr};
+    PF_PreRenderExtra pre_extra = {&pre_input, &pre_output, &pre_callbacks};
+    err = effect_main(PF_Cmd_SMART_PRE_RENDER, &in_data, &out_data, nullptr, nullptr, &pre_extra);
+    Check(err == PF_Err_NONE, label + ": smart pre-render succeeds");
+    const bool possible = (pre_output.flags & PF_RenderOutputFlag_GPU_RENDER_POSSIBLE) != 0;
+    Check(possible == gpu_checkbox, label + ": GPU rendering offered exactly when GPU Acceleration is on");
+
+    bool rendered = false;
+    if (possible) {
+        const int ow = pre_output.result_rect.right - pre_output.result_rect.left;
+        const int oh = pre_output.result_rect.bottom - pre_output.result_rect.top;
+
+        // The scene, as a float world, then as a BGRA GPU frame with padding.
+        WorldStorage scene_storage;
+        PF_EffectWorld scene = {};
+        MakeWorld(&scene, &scene_storage, w, h, 32, host->layer_rect);
+        FillTestScene(&scene, 32);
+        const int in_pitch = w + 3;
+        const int out_pitch = ow + 5;
+        void* in_mem = nullptr;
+        void* out_mem = nullptr;
+        MockAllocateDeviceMemory(nullptr, 0, static_cast<size_t>(in_pitch) * h * 16, &in_mem);
+        MockAllocateDeviceMemory(nullptr, 0, static_cast<size_t>(out_pitch) * oh * 16, &out_mem);
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const cosmic::PixelF p = reinterpret_cast<const cosmic::PixelF*>(scene.data)[y * w + x];
+                float* q = static_cast<float*>(in_mem) + (static_cast<std::size_t>(y) * in_pitch + x) * 4;
+                q[0] = p.b;
+                q[1] = p.g;
+                q[2] = p.r;
+                q[3] = p.a;
+            }
+        }
+        std::memset(&host->input_world, 0, sizeof(host->input_world));
+        host->input_world.width = w;
+        host->input_world.height = h;
+        host->input_world.rowbytes = in_pitch * 16;
+        host->input_world.origin_x = 0;
+        host->input_world.origin_y = 0;
+        std::memset(&host->output_world, 0, sizeof(host->output_world));
+        host->output_world.width = ow;
+        host->output_world.height = oh;
+        host->output_world.rowbytes = out_pitch * 16;
+        host->output_world.origin_x = pre_output.result_rect.left;
+        host->output_world.origin_y = pre_output.result_rect.top;
+        g_gpu_world_data[&host->input_world] = in_mem;
+        g_gpu_world_data[&host->output_world] = out_mem;
+
+        PF_SmartRenderInput render_input = {};
+        render_input.output_request = pre_input.output_request;
+        render_input.bitdepth = 32;
+        render_input.pre_render_data = pre_output.pre_render_data;
+        render_input.gpu_data = setup_out.gpu_data;
+        render_input.what_gpu = PF_GPU_Framework_CUDA;
+        render_input.device_index = 0;
+        PF_SmartRenderCallbacks render_callbacks = {MockCheckoutLayerPixels, MockCheckinLayerPixels,
+                                                    MockCheckoutOutput};
+        PF_SmartRenderExtra render_extra = {&render_input, &render_callbacks};
+        err = effect_main(PF_Cmd_SMART_RENDER_GPU, &in_data, &out_data, nullptr, nullptr, &render_extra);
+        Check(err == PF_Err_NONE, label + ": smart render GPU succeeds");
+        rendered = err == PF_Err_NONE;
+
+        if (out_image != nullptr) {
+            out_image->Resize(ow, oh, cosmic::PixelDepth::kFloat32);
+            for (int y = 0; y < oh; ++y) {
+                for (int x = 0; x < ow; ++x) {
+                    const float* q = static_cast<const float*>(out_mem) + (static_cast<std::size_t>(y) * out_pitch + x) * 4;
+                    out_image->SetPixel(x, y, cosmic::PixelF{q[3], q[2], q[1], q[0]});
+                }
+            }
+        }
+        if (out_rect != nullptr) *out_rect = pre_output.result_rect;
+        g_gpu_world_data.clear();
+        MockFreeDeviceMemory(nullptr, 0, in_mem);
+        MockFreeDeviceMemory(nullptr, 0, out_mem);
+    }
+    if (pre_output.delete_pre_render_data_func != nullptr) {
+        pre_output.delete_pre_render_data_func(pre_output.pre_render_data);
+    }
+
+    PF_GPUDeviceSetdownInput setdown_in = {setup_out.gpu_data, PF_GPU_Framework_CUDA, 0};
+    PF_GPUDeviceSetdownExtra setdown = {&setdown_in};
+    err = effect_main(PF_Cmd_GPU_DEVICE_SETDOWN, &in_data, &out_data, nullptr, nullptr, &setdown);
+    Check(err == PF_Err_NONE, label + ": GPU device setdown succeeds");
+    Check(g_device_live.empty(), label + ": all device memory was freed");
+    Check(host->live_handles.empty(), label + ": no host handles leaked");
+
+    g_host = nullptr;
+    delete host;
+    return rendered;
+}
+
+double MaxDifference(const cosmic_test::TestImage& a, const cosmic_test::TestImage& b) {
+    if (a.View().width != b.View().width || a.View().height != b.View().height) return 1.0e9;
+    double worst = 0.0;
+    for (int y = 0; y < a.View().height; ++y) {
+        for (int x = 0; x < a.View().width; ++x) {
+            const cosmic::PixelF p = a.GetPixel(x, y);
+            const cosmic::PixelF q = b.GetPixel(x, y);
+            if (!std::isfinite(q.a) || !std::isfinite(q.r) || !std::isfinite(q.g) || !std::isfinite(q.b)) return 1.0e9;
+            worst = std::max({worst, (double)std::fabs(p.a - q.a), (double)std::fabs(p.r - q.r),
+                              (double)std::fabs(p.g - q.g), (double)std::fabs(p.b - q.b)});
+        }
+    }
+    return worst;
+}
+
+void TestGpu(EffectMainFn effect_main) {
+    std::printf("-- GPU (CUDA through the fake driver)\n");
+    std::vector<RenderOptions> cases;
+    cases.push_back({"defaults", 32});
+    {
+        RenderOptions o{"defocus_turbulence", 32};
+        o.defocus = 14.0f;
+        o.turbulence = 12.0f;
+        o.depth_shape = 5;  // Bulge
+        cases.push_back(o);
+    }
+    {
+        RenderOptions o{"full_frame_half", 32};
+        o.matte = 3;
+        o.type = 2;
+        o.downsample = 2;
+        cases.push_back(o);
+    }
+    {
+        RenderOptions o{"odd_no_expand", 32, 97, 61};
+        o.expand_bounds = false;
+        o.animate_grain = true;
+        cases.push_back(o);
+    }
+    for (const RenderOptions& options : cases) {
+        cosmic_test::TestImage cpu;
+        cosmic_test::TestImage gpu;
+        PF_LRect cpu_rect = {};
+        PF_LRect gpu_rect = {};
+        RunRender(effect_main, options, "", &cpu, &cpu_rect);
+        if (!RunGpuRender(effect_main, options, true, &gpu, &gpu_rect)) continue;
+        Check(cpu_rect.left == gpu_rect.left && cpu_rect.right == gpu_rect.right && cpu_rect.top == gpu_rect.top &&
+                  cpu_rect.bottom == gpu_rect.bottom,
+              options.label + ": GPU and CPU declare the same bounds");
+        const double diff = MaxDifference(cpu, gpu);
+        char line[128];
+        std::snprintf(line, sizeof(line), "%s: GPU frame matches the CPU frame (max difference %.2e)",
+                      options.label.c_str(), diff);
+        std::printf("   %s\n", line);
+        Check(diff < 2.0e-3, line);
+    }
+
+    // GPU Acceleration off: After Effects is told to render on the CPU.
+    RunGpuRender(effect_main, cases[0], false, nullptr, nullptr);
+
+    // A device that fails mid-render: the frame still comes out, via the CPU.
+    if (g_fake_fail != nullptr) {
+        cosmic_test::TestImage cpu;
+        cosmic_test::TestImage gpu;
+        RunRender(effect_main, cases[1], "", &cpu, nullptr);
+        g_fake_fail(1000000);
+        const bool rendered = RunGpuRender(effect_main, cases[1], true, &gpu, nullptr);
+        g_fake_fail(0);
+        Check(rendered, "a failing GPU falls back to the CPU");
+        Check(MaxDifference(cpu, gpu) < 2.0e-3, "and the fallback frame matches the CPU frame");
+    }
+
+    // Anything but CUDA is declined, so After Effects renders on the CPU.
+    {
+        PF_InData in_data;
+        PF_OutData out_data;
+        PF_UtilCallbacks utils;
+        MockHost* host = NewInstance(effect_main, &in_data, &out_data, &utils, 64, 64);
+        PF_GPUDeviceSetupInput setup_in = {PF_GPU_Framework_OPENCL, 0};
+        PF_GPUDeviceSetupOutput setup_out = {nullptr};
+        PF_GPUDeviceSetupExtra setup = {&setup_in, &setup_out};
+        out_data.out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+        const PF_Err err = effect_main(PF_Cmd_GPU_DEVICE_SETUP, &in_data, &out_data, nullptr, nullptr, &setup);
+        Check(err == PF_Err_NONE && setup_out.gpu_data == nullptr &&
+                  (out_data.out_flags2 & PF_OutFlag2_SUPPORTS_GPU_RENDER_F32) == 0,
+              "an OpenCL device is declined");
+        g_host = nullptr;
+        delete host;
+    }
+
+    if (g_fake_stats != nullptr) {
+        int loaded = 0, unloaded = 0, launches = 0, violations = 0;
+        g_fake_stats(&loaded, &unloaded, &launches, &violations);
+        std::printf("   fake driver: %d module loads, %d unloads, %d kernel launches\n", loaded, unloaded, launches);
+        Check(loaded > 0 && loaded == unloaded, "every module loaded is unloaded");
+        Check(launches > 0, "kernels ran on the device");
+        Check(violations == 0, "every driver call had the context current");
+    }
+}
+
+void TestV10Project(EffectMainFn effect_main) {
+    std::printf("-- a project saved with v1.0\n");
+    // After Effects restores saved values by parameter id; the ids v1.0 had
+    // are unchanged, so its values land on the same controls. Values only
+    // v1.0 could have produced must still render.
+    PF_InData in_data;
+    PF_OutData out_data;
+    PF_UtilCallbacks utils;
+    MockHost* host = NewInstance(effect_main, &in_data, &out_data, &utils, 160, 90);
+    std::string depth_names;
+    for (const std::string& names : host->popup_strings) {
+        if (names.rfind("Dome|", 0) == 0) depth_names = names;
+    }
+    Check(depth_names.rfind("Dome|Sphere|Ridge|Wave|", 0) == 0,
+          "Depth Shape keeps v1.0's four entries in place (" + depth_names + ")");
+    Check(Param(host, kIndexDepthShape).u.pd.num_choices == 5, "and appends Bulge");
+    Check(Param(host, kIndexLoopWithAngle).u.bd.value == FALSE, "new instances do not loop the noise with the angle");
+    Check(Param(host, kIndexGpu).u.bd.value == TRUE, "GPU Acceleration is on for new and old projects alike");
+    g_host = nullptr;
+    delete host;
+
+    RenderOptions o{"v1.0 values", 8, 160, 90};
+    o.depth_shape = 4;  // Wave, a v1.0 value
+    o.turbulence = 10.0f;
+    RunRender(effect_main, o, "");
 }
 
 void TestPaletteSupervision(EffectMainFn effect_main) {
@@ -471,10 +835,10 @@ void TestPaletteSupervision(EffectMainFn effect_main) {
           "the palette popup has every preset plus Custom");
     Check((Param(host, kIndexPalette).flags & PF_ParamFlag_SUPERVISE) != 0, "the palette popup is supervised");
 
-    std::vector<PF_ParamDef*> params(kParamCountAsShipped, nullptr);
+    std::vector<PF_ParamDef*> params(kParamCount, nullptr);
     PF_ParamDef input = {};
     params[0] = &input;
-    for (int i = 1; i < kParamCountAsShipped; ++i) params[static_cast<std::size_t>(i)] = &Param(host, i);
+    for (int i = 1; i < kParamCount; ++i) params[static_cast<std::size_t>(i)] = &Param(host, i);
 
     // Pick Sunset: the colours follow.
     const int sunset = 4;
@@ -528,8 +892,25 @@ int main(int argc, char** argv) {
     }
     const std::string plugin_path = argv[1];
     const std::string out_dir = argc > 2 ? argv[2] : "";
+    const std::string fake_cuda = argc > 3 ? argv[3] : "";
 
     g_basic_suite.AcquireSuite = MockAcquireSuite;
+    g_gpu_suite.GetDeviceCount = MockGetDeviceCount;
+    g_gpu_suite.GetDeviceInfo = MockGetDeviceInfo;
+    g_gpu_suite.AllocateDeviceMemory = MockAllocateDeviceMemory;
+    g_gpu_suite.FreeDeviceMemory = MockFreeDeviceMemory;
+    g_gpu_suite.GetGPUWorldData = MockGetGPUWorldData;
+    g_world_suite.PF_GetPixelFormat = MockGetPixelFormat;
+
+    // The fake driver is loaded first, so the plug-in finds it as nvcuda.dll.
+    if (!fake_cuda.empty()) {
+        HMODULE fake = LoadLibraryA(fake_cuda.c_str());
+        Check(fake != nullptr, "the fake CUDA driver loads");
+        if (fake != nullptr) {
+            g_fake_stats = reinterpret_cast<FakeStatsFn>(reinterpret_cast<void*>(GetProcAddress(fake, "FakeCudaStats")));
+            g_fake_fail = reinterpret_cast<FakeFailFn>(reinterpret_cast<void*>(GetProcAddress(fake, "FakeCudaFailLaunches")));
+        }
+    }
     g_basic_suite.ReleaseSuite = MockReleaseSuite;
     g_iterate_suite.iterate_generic = MockIterateGeneric;
 
@@ -544,6 +925,7 @@ int main(int argc, char** argv) {
     if (effect_main == nullptr) return 1;
 
     TestPaletteSupervision(effect_main);
+    TestV10Project(effect_main);
 
     std::vector<RenderOptions> cases;
     cases.push_back({"8bpc", 8});
@@ -588,6 +970,12 @@ int main(int argc, char** argv) {
         RenderOptions options = cases[0];
         options.label = "repeat";
         RunRender(effect_main, options, "");
+    }
+
+    if (!fake_cuda.empty()) {
+        TestGpu(effect_main);
+    } else {
+        std::printf("-- GPU: skipped (no fake CUDA driver given)\n");
     }
 
     FreeLibrary(module);

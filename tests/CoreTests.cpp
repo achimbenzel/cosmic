@@ -427,6 +427,76 @@ void TestRepeatModes() {
           "Mirror folds back");
 }
 
+void TestBulge() {
+    std::printf("geometry: bulge magnifies inside its radius and leaves the rest alone\n");
+    cosmic::UiValues ui = Plain(1000, 1000);
+    ui.fit = 2;
+    ui.angle_deg = 90.0f;  // left to right
+    ui.depth_shape = 5;
+    ui.depth_x = 500.0f;
+    ui.depth_y = 500.0f;
+    ui.depth_radius_pct = 20.0f;  // 200 px
+    cosmic::ReferenceBox box;
+    box.width = 1000.0f;
+    box.height = 1000.0f;
+    auto slope = [&](float depth_pct, float x) {
+        ui.depth_pct = depth_pct;
+        const cosmic::CosmicSettings s = cosmic::SettingsFromUi(ui, 1000.0f, 1000.0f, 0);
+        return cosmic::GradientCoordinate(s, box, x + 1.0f, 500.0f) - cosmic::GradientCoordinate(s, box, x - 1.0f, 500.0f);
+    };
+    const float plain = slope(0.0f, 500.0f);
+    Check(slope(60.0f, 500.0f) < plain * 0.6f, "positive depth magnifies the centre");
+    Check(slope(-60.0f, 500.0f) > plain * 1.4f, "negative depth pinches the centre");
+    Check(std::fabs(slope(60.0f, 800.0f) - plain) < 1.0e-5f, "outside the radius nothing moves");
+
+    // One-to-one at any strength: the coordinate never runs backwards.
+    bool monotonic = true;
+    for (float depth : {-1000.0f, -120.0f, 95.0f, 1000.0f}) {
+        ui.depth_pct = depth;
+        const cosmic::CosmicSettings s = cosmic::SettingsFromUi(ui, 1000.0f, 1000.0f, 0);
+        float previous = -1.0f;
+        for (int x = 250; x <= 750; ++x) {
+            const float t = cosmic::GradientCoordinate(s, box, static_cast<float>(x), 500.0f);
+            if (t < previous - 1.0e-6f) monotonic = false;
+            previous = t;
+        }
+    }
+    Check(monotonic, "no fold-over at extreme depths");
+}
+
+void TestDefaults() {
+    std::printf("defaults: turbulence does not follow the angle unless asked to\n");
+    cosmic::UiValues ui = Plain(100, 100);
+    ui.angle_deg = 123.0f;
+    ui.evolution_deg = 10.0f;
+    const cosmic::CosmicSettings s = cosmic::SettingsFromUi(ui, 100.0f, 100.0f, 0);
+    Check(std::fabs(s.evolution - 10.0f * 3.14159265f / 180.0f) < 1.0e-5f, "evolution is the Evolution control");
+    ui.evolve_with_angle = true;
+    const cosmic::CosmicSettings looped = cosmic::SettingsFromUi(ui, 100.0f, 100.0f, 0);
+    Check(std::fabs(looped.evolution - 133.0f * 3.14159265f / 180.0f) < 1.0e-5f, "Loop With Angle adds the angle");
+}
+
+void TestFullFrameEdges() {
+    std::printf("render: a full-frame blur carries the edge on instead of darkening it\n");
+    const int w = 200;
+    const int h = 120;
+    cosmic::UiValues ui = Plain(w, h);
+    ui.matte = 3;
+    cosmic::ApplyPreset(&ui, 13);
+    for (int k = 0; k < cosmic::kStopCount; ++k) ui.colors[k][0] = ui.colors[k][1] = ui.colors[k][2] = 128;
+    ui.grain_pct = 0.0f;
+    ui.glow_intensity_pct = 0.0f;
+    ui.diffusion_pct = 100.0f;
+    ui.diffusion_radius_px = 80.0f;
+    ui.defocus_px = 30.0f;
+    ui.focus_radius_pct = 0.0f;
+    const Output out = Render(ui, nullptr, w, h, PixelDepth::kFloat32);
+    const PixelF corner = out.image.GetPixel(0, 0);
+    const PixelF centre = out.image.GetPixel(w / 2, h / 2);
+    Check(std::fabs(corner.g - centre.g) < 1.0e-3f && corner.a > 0.999f,
+          Fmt("flat grey stays flat to the corner (%.4f vs %.4f)", corner.g, centre.g));
+}
+
 void TestMemoryBalanceAndOptions() {
     std::printf("render: every option renders and frees what it allocates\n");
     const int w = 180;
@@ -441,7 +511,7 @@ void TestMemoryBalanceAndOptions() {
                 ui.gradient_type = type;
                 ui.matte = matte;
                 ui.blend = blend;
-                ui.depth_shape = 1 + (type + blend) % 4;
+                ui.depth_shape = 1 + (type + blend) % 5;
                 ui.color_blend = 1 + (matte + blend) % 4;
                 ui.repeat = 1 + type % 3;
                 ui.defocus_px = (blend % 2) ? 5.0f : 0.0f;
@@ -508,6 +578,8 @@ int main() {
     TestPyramidSigma();
     TestContentBounds();
     TestRepeatModes();
+    TestBulge();
+    TestDefaults();
     TestSeamlessLoopRender();
     TestBitDepthsAgree();
     TestTransparencyAndPremultiplication();
@@ -515,6 +587,7 @@ int main() {
     TestGlowConservesLight();
     TestResolutionIndependence();
     TestNoBanding();
+    TestFullFrameEdges();
     TestMemoryBalanceAndOptions();
     std::printf("\n%d checks, %d failed\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

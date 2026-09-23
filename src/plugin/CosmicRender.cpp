@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <cmath>
 #include <new>
+#include <vector>
 
 #include "AeAdapters.h"
 #include "CosmicParams.h"
+#include "CudaDevice.h"
 #include "core/CosmicPipeline.h"
+#include "gpu/GpuPipeline.h"
 
 namespace cosmic {
 namespace {
@@ -68,47 +71,170 @@ void ResolveWorldOrigin(const PF_EffectWorld* world, const PF_LRect& declared, A
     }
 }
 
-PF_Err RunPipeline(PF_InData* in_data, const CosmicSettings& settings, PF_EffectWorld* input_world,
-                   int source_left, int source_top, PF_EffectWorld* output_world, int dest_left, int dest_top,
-                   PixelDepth depth) {
+void RenderMapping(const PF_InData* in_data, float* to_full_x, float* to_full_y) {
+    const float dsx = RationalToFloat(in_data->downsample_x);
+    const float dsy = RationalToFloat(in_data->downsample_y);
+    const float par = RationalToFloat(in_data->pixel_aspect_ratio);
+    *to_full_x = (par > 0.0f ? par : 1.0f) / (dsx > 0.0f ? dsx : 1.0f);
+    *to_full_y = 1.0f / (dsy > 0.0f ? dsy : 1.0f);
+}
+
+// A suite acquired for the length of a scope.
+template <typename Suite>
+class ScopedSuite {
+public:
+    ScopedSuite(SPBasicSuite* basic, const char* name, int version)
+        : basic_(basic), name_(name), version_(version), suite_(AcquireSuite<Suite>(basic, name, version)) {}
+    ~ScopedSuite() {
+        if (suite_ != nullptr) basic_->ReleaseSuite(name_, version_);
+    }
+    ScopedSuite(const ScopedSuite&) = delete;
+    ScopedSuite& operator=(const ScopedSuite&) = delete;
+
+    Suite* get() const { return suite_; }
+    Suite* operator->() const { return suite_; }
+
+private:
+    SPBasicSuite* basic_;
+    const char* name_;
+    int version_;
+    Suite* suite_;
+};
+
+PF_Err ToPfErr(CosmicResult result) {
+    switch (result) {
+        case CosmicResult::kOk: return PF_Err_NONE;
+        case CosmicResult::kOutOfMemory: return PF_Err_OUT_OF_MEMORY;
+        case CosmicResult::kInvalidArguments: return PF_Err_BAD_CALLBACK_PARAM;
+        case CosmicResult::kDeviceError:
+        default: return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+}
+
+// The CPU renderer on host images, with host memory and the host's threads.
+PF_Err RunPipeline(PF_InData* in_data, const CosmicSettings& settings, const HostImage& source, int source_left,
+                   int source_top, const HostImage& dest, int dest_left, int dest_top) {
     SPBasicSuite* basic = in_data->pica_basicP;
     if (basic == nullptr) return PF_Err_BAD_CALLBACK_PARAM;
+    ScopedSuite<PF_HandleSuite1> handle_suite(basic, kPFHandleSuite, kPFHandleSuiteVersion1);
+    if (handle_suite.get() == nullptr) return PF_Err_OUT_OF_MEMORY;
+    ScopedSuite<PF_Iterate8Suite1> iterate_suite(basic, kPFIterate8Suite, kPFIterate8SuiteVersion1);
 
-    PF_HandleSuite1* handle_suite = AcquireSuite<PF_HandleSuite1>(basic, kPFHandleSuite, kPFHandleSuiteVersion1);
-    if (handle_suite == nullptr) return PF_Err_OUT_OF_MEMORY;
-    PF_Iterate8Suite1* iterate_suite =
-        AcquireSuite<PF_Iterate8Suite1>(basic, kPFIterate8Suite, kPFIterate8SuiteVersion1);
+    AeAllocator allocator(in_data, handle_suite.get());
+    AeTaskRunner runner(in_data, iterate_suite.get());
 
-    PF_Err err = PF_Err_NONE;
-    {
-        AeAllocator allocator(in_data, handle_suite);
-        AeTaskRunner runner(in_data, iterate_suite);
+    CosmicRender render;
+    render.source = source;
+    render.source_left = source_left;
+    render.source_top = source_top;
+    render.dest = dest;
+    render.dest_left = dest_left;
+    render.dest_top = dest_top;
+    RenderMapping(in_data, &render.to_full_x, &render.to_full_y);
+    render.blur_scale = BlurScale(in_data);
+    return ToPfErr(RenderCosmic(settings, render, allocator, runner));
+}
 
-        const float dsx = RationalToFloat(in_data->downsample_x);
-        const float dsy = RationalToFloat(in_data->downsample_y);
-        const float par = RationalToFloat(in_data->pixel_aspect_ratio);
+// GPU frames always hold 32-bit float, whatever the project's depth, so the
+// Auto working space is decided from the depth the host reports instead.
+CosmicSettings ResolveWorkingSpace(CosmicSettings settings, short bitdepth) {
+    if (settings.working_space == WorkingSpace::kAuto) {
+        settings.working_space = bitdepth == 32 ? WorkingSpace::kLinear : WorkingSpace::kSrgb;
+    }
+    return settings;
+}
 
-        CosmicRender render;
-        render.source = MakeHostImage(input_world, depth);
-        render.source_left = source_left;
-        render.source_top = source_top;
-        render.dest = MakeHostImage(output_world, depth);
-        render.dest_left = dest_left;
-        render.dest_top = dest_top;
-        render.to_full_x = (par > 0.0f ? par : 1.0f) / (dsx > 0.0f ? dsx : 1.0f);
-        render.to_full_y = 1.0f / (dsy > 0.0f ? dsy : 1.0f);
-        render.blur_scale = BlurScale(in_data);
+// Last resort for a GPU render the device could not do (out of video memory,
+// a driver error): bring the frames to the host, render them on the CPU and
+// send the result back, so the frame still comes out right.
+PF_Err RenderGpuFramesOnCpu(PF_InData* in_data, const CosmicSettings& settings, CudaDevice& device,
+                            PF_EffectWorld* input_world, void* input_mem, int input_left, int input_top,
+                            PF_EffectWorld* output_world, void* output_mem, int output_left, int output_top) {
+    if (!device.Valid() || output_mem == nullptr) return PF_Err_INTERNAL_STRUCT_DAMAGED;
 
-        switch (RenderCosmic(settings, render, allocator, runner)) {
-            case CosmicResult::kOk: break;
-            case CosmicResult::kOutOfMemory: err = PF_Err_OUT_OF_MEMORY; break;
-            case CosmicResult::kInvalidArguments: err = PF_Err_BAD_CALLBACK_PARAM; break;
+    auto download = [&](PF_EffectWorld* world, void* mem, std::vector<PixelF>* out) {
+        const std::size_t bytes = static_cast<std::size_t>(world->rowbytes) * static_cast<std::size_t>(world->height);
+        std::vector<unsigned char> raw(bytes);
+        if (!device.Download(raw.data(), reinterpret_cast<DevicePtr>(mem), bytes)) return false;
+        out->resize(static_cast<std::size_t>(world->width) * static_cast<std::size_t>(world->height));
+        for (A_long y = 0; y < world->height; ++y) {
+            const FrameBGRA* row = reinterpret_cast<const FrameBGRA*>(raw.data() + y * world->rowbytes);
+            for (A_long x = 0; x < world->width; ++x) {
+                (*out)[static_cast<std::size_t>(y) * world->width + x] = PixelF{row[x].a, row[x].r, row[x].g, row[x].b};
+            }
         }
+        return true;
+    };
+
+    std::vector<PixelF> source_pixels;
+    HostImage source;
+    if (input_world != nullptr && input_mem != nullptr) {
+        if (!download(input_world, input_mem, &source_pixels)) return PF_Err_INTERNAL_STRUCT_DAMAGED;
+        source.data = source_pixels.data();
+        source.rowbytes = input_world->width * static_cast<int>(sizeof(PixelF));
+        source.width = input_world->width;
+        source.height = input_world->height;
+        source.depth = PixelDepth::kFloat32;
     }
 
-    if (iterate_suite != nullptr) basic->ReleaseSuite(kPFIterate8Suite, kPFIterate8SuiteVersion1);
-    basic->ReleaseSuite(kPFHandleSuite, kPFHandleSuiteVersion1);
-    return err;
+    std::vector<PixelF> dest_pixels(static_cast<std::size_t>(output_world->width) * output_world->height);
+    HostImage dest;
+    dest.data = dest_pixels.data();
+    dest.rowbytes = output_world->width * static_cast<int>(sizeof(PixelF));
+    dest.width = output_world->width;
+    dest.height = output_world->height;
+    dest.depth = PixelDepth::kFloat32;
+
+    PF_Err err = RunPipeline(in_data, settings, source, input_left, input_top, dest, output_left, output_top);
+    if (err) return err;
+
+    const std::size_t bytes =
+        static_cast<std::size_t>(output_world->rowbytes) * static_cast<std::size_t>(output_world->height);
+    std::vector<unsigned char> raw(bytes, 0);
+    for (A_long y = 0; y < output_world->height; ++y) {
+        FrameBGRA* row = reinterpret_cast<FrameBGRA*>(raw.data() + y * output_world->rowbytes);
+        for (A_long x = 0; x < output_world->width; ++x) {
+            const PixelF& p = dest_pixels[static_cast<std::size_t>(y) * output_world->width + x];
+            row[x] = FrameBGRA{p.b, p.g, p.r, p.a};
+        }
+    }
+    return device.Upload(reinterpret_cast<DevicePtr>(output_mem), raw.data(), bytes) ? PF_Err_NONE
+                                                                                     : PF_Err_INTERNAL_STRUCT_DAMAGED;
+}
+
+struct CheckedOutFrames {
+    PF_EffectWorld* input = nullptr;
+    PF_EffectWorld* output = nullptr;
+    A_long input_left = 0;
+    A_long input_top = 0;
+    A_long output_left = 0;
+    A_long output_top = 0;
+};
+
+PF_Err CheckOutFrames(PF_InData* in_data, PF_SmartRenderExtra* extra, const PreRenderData& data, bool gpu,
+                      CheckedOutFrames* frames) {
+    PF_Err err = PF_Err_NONE;
+    if (data.has_input) {
+        ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, kInputCheckoutId, &frames->input));
+    }
+    ERR(extra->cb->checkout_output(in_data->effect_ref, &frames->output));
+    if (err) return err;
+    if (frames->output == nullptr) return PF_Err_NONE;
+
+    frames->output_left = data.output_rect.left;
+    frames->output_top = data.output_rect.top;
+    ResolveWorldOrigin(frames->output, data.output_rect, &frames->output_left, &frames->output_top);
+
+    // GPU frames have no host data pointer; their pixels are on the device.
+    const bool has_input = frames->input != nullptr && (gpu || frames->input->data != nullptr);
+    if (has_input) {
+        frames->input_left = data.input_rect.left;
+        frames->input_top = data.input_rect.top;
+        ResolveWorldOrigin(frames->input, data.input_rect, &frames->input_left, &frames->input_top);
+    } else {
+        frames->input = nullptr;
+    }
+    return PF_Err_NONE;
 }
 
 }  // namespace
@@ -169,6 +295,11 @@ PF_Err SmartPreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtr
     extra->output->max_result_rect = output_rect;
     extra->output->solid = FALSE;
     extra->output->flags |= PF_RenderOutputFlag_RETURNS_EXTRA_PIXELS;
+    // The GPU renders when the project uses CUDA, the device accepted the
+    // kernels at GPU_DEVICE_SETUP, and the user has not switched it off.
+    if (params.gpu && extra->input->what_gpu == PF_GPU_Framework_CUDA && extra->input->gpu_data != nullptr) {
+        extra->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
+    }
     extra->output->pre_render_data = data;
     extra->output->delete_pre_render_data_func = DeletePreRenderData;
     return PF_Err_NONE;
@@ -176,39 +307,107 @@ PF_Err SmartPreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtr
 
 PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* extra) {
     (void)out_data;
-    PF_Err err = PF_Err_NONE;
-
     PreRenderData* data = static_cast<PreRenderData*>(extra->input->pre_render_data);
     if (data == nullptr) return PF_Err_INTERNAL_STRUCT_DAMAGED;
 
-    PF_EffectWorld* input_world = nullptr;
-    PF_EffectWorld* output_world = nullptr;
-
-    if (data->has_input) {
-        ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, kInputCheckoutId, &input_world));
-    }
-    ERR(extra->cb->checkout_output(in_data->effect_ref, &output_world));
-    if (err) return err;
-    if (output_world == nullptr) return PF_Err_NONE;
-
-    A_long output_left = data->output_rect.left;
-    A_long output_top = data->output_rect.top;
-    ResolveWorldOrigin(output_world, data->output_rect, &output_left, &output_top);
-
-    A_long input_left = 0;
-    A_long input_top = 0;
-    if (input_world != nullptr && input_world->data != nullptr) {
-        input_left = data->input_rect.left;
-        input_top = data->input_rect.top;
-        ResolveWorldOrigin(input_world, data->input_rect, &input_left, &input_top);
-    } else {
-        input_world = nullptr;
-    }
+    CheckedOutFrames frames;
+    PF_Err err = CheckOutFrames(in_data, extra, *data, false, &frames);
+    if (err || frames.output == nullptr) return err;
 
     const PixelDepth depth = DepthFromBitsPerChannel(extra->input->bitdepth);
-    return RunPipeline(in_data, data->params.settings, input_world, static_cast<int>(input_left),
-                       static_cast<int>(input_top), output_world, static_cast<int>(output_left),
-                       static_cast<int>(output_top), depth);
+    return RunPipeline(in_data, data->params.settings, MakeHostImage(frames.input, depth),
+                       static_cast<int>(frames.input_left), static_cast<int>(frames.input_top),
+                       MakeHostImage(frames.output, depth), static_cast<int>(frames.output_left),
+                       static_cast<int>(frames.output_top));
+}
+
+PF_Err GpuDeviceSetup(PF_InData* in_data, PF_OutData* out_data, PF_GPUDeviceSetupExtra* extra) {
+    // Only CUDA is implemented. Declining a device is not an error: After
+    // Effects then renders the effect on the CPU for it.
+    extra->output->gpu_data = nullptr;
+    out_data->out_flags2 &= ~static_cast<PF_OutFlags2>(PF_OutFlag2_SUPPORTS_GPU_RENDER_F32);
+    if (extra->input->what_gpu != PF_GPU_Framework_CUDA) return PF_Err_NONE;
+
+    ScopedSuite<PF_GPUDeviceSuite1> gpu_suite(in_data->pica_basicP, kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+    if (gpu_suite.get() == nullptr) return PF_Err_NONE;
+    PF_GPUDeviceInfo info = {};
+    if (gpu_suite->GetDeviceInfo(in_data->effect_ref, extra->input->device_index, &info) != PF_Err_NONE) {
+        return PF_Err_NONE;
+    }
+    CudaKernels* kernels = CudaKernels::Create(info.contextPV);
+    if (kernels == nullptr) return PF_Err_NONE;
+    extra->output->gpu_data = kernels;
+    out_data->out_flags2 |= PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+    return PF_Err_NONE;
+}
+
+PF_Err GpuDeviceSetdown(PF_InData* in_data, PF_OutData* out_data, PF_GPUDeviceSetdownExtra* extra) {
+    (void)in_data;
+    (void)out_data;
+    delete static_cast<CudaKernels*>(extra->input->gpu_data);
+    extra->input->gpu_data = nullptr;
+    return PF_Err_NONE;
+}
+
+PF_Err SmartRenderGpu(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* extra) {
+    (void)out_data;
+    PreRenderData* data = static_cast<PreRenderData*>(extra->input->pre_render_data);
+    const CudaKernels* kernels = static_cast<const CudaKernels*>(extra->input->gpu_data);
+    if (data == nullptr || kernels == nullptr) return PF_Err_INTERNAL_STRUCT_DAMAGED;
+
+    CheckedOutFrames frames;
+    PF_Err err = CheckOutFrames(in_data, extra, *data, true, &frames);
+    if (err || frames.output == nullptr) return err;
+
+    SPBasicSuite* basic = in_data->pica_basicP;
+    ScopedSuite<PF_GPUDeviceSuite1> gpu_suite(basic, kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+    if (gpu_suite.get() == nullptr) return PF_Err_BAD_CALLBACK_PARAM;
+    {
+        ScopedSuite<PF_WorldSuite2> world_suite(basic, kPFWorldSuite, kPFWorldSuiteVersion2);
+        PF_PixelFormat format = PF_PixelFormat_GPU_BGRA128;
+        if (world_suite.get() != nullptr) world_suite->PF_GetPixelFormat(frames.output, &format);
+        if (format != PF_PixelFormat_GPU_BGRA128) return PF_Err_UNRECOGNIZED_PARAM_TYPE;
+    }
+
+    void* input_mem = nullptr;
+    void* output_mem = nullptr;
+    if (frames.input != nullptr) ERR(gpu_suite->GetGPUWorldData(in_data->effect_ref, frames.input, &input_mem));
+    ERR(gpu_suite->GetGPUWorldData(in_data->effect_ref, frames.output, &output_mem));
+    PF_GPUDeviceInfo info = {};
+    ERR(gpu_suite->GetDeviceInfo(in_data->effect_ref, extra->input->device_index, &info));
+    if (err) return err;
+    if (output_mem == nullptr) return PF_Err_INTERNAL_STRUCT_DAMAGED;
+
+    const CosmicSettings settings = ResolveWorkingSpace(data->params.settings, extra->input->bitdepth);
+    constexpr int kFrameBytes = static_cast<int>(sizeof(FrameBGRA));
+
+    GpuRender render;
+    if (frames.input != nullptr && input_mem != nullptr) {
+        render.source = GpuFrame{reinterpret_cast<DevicePtr>(input_mem), static_cast<int>(frames.input->width),
+                                 static_cast<int>(frames.input->height),
+                                 static_cast<int>(frames.input->rowbytes) / kFrameBytes};
+        render.source_left = static_cast<int>(frames.input_left);
+        render.source_top = static_cast<int>(frames.input_top);
+    }
+    render.dest = GpuFrame{reinterpret_cast<DevicePtr>(output_mem), static_cast<int>(frames.output->width),
+                           static_cast<int>(frames.output->height),
+                           static_cast<int>(frames.output->rowbytes) / kFrameBytes};
+    render.dest_left = static_cast<int>(frames.output_left);
+    render.dest_top = static_cast<int>(frames.output_top);
+    RenderMapping(in_data, &render.to_full_x, &render.to_full_y);
+    render.blur_scale = BlurScale(in_data);
+    render.float_project = settings.working_space == WorkingSpace::kLinear;
+
+    CudaDevice device(*kernels, info.command_queuePV, in_data->effect_ref, gpu_suite.get(),
+                      extra->input->device_index);
+    CosmicResult result = CosmicResult::kDeviceError;
+    if (device.Valid()) result = RenderCosmicGpu(settings, render, device);
+    if (result == CosmicResult::kOk) return PF_Err_NONE;
+    if (result == CosmicResult::kInvalidArguments) return PF_Err_BAD_CALLBACK_PARAM;
+    return RenderGpuFramesOnCpu(in_data, settings, device, frames.input, input_mem,
+                                static_cast<int>(frames.input_left), static_cast<int>(frames.input_top),
+                                frames.output, output_mem, static_cast<int>(frames.output_left),
+                                static_cast<int>(frames.output_top));
 }
 
 PF_Err LegacyFrameSetup(PF_InData* in_data, PF_OutData* out_data) {
@@ -238,9 +437,9 @@ PF_Err LegacyRender(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* param
     const PixelDepth depth = PF_WORLD_IS_DEEP(output) ? PixelDepth::kBits16 : PixelDepth::kBits8;
 
     // output_origin says where the input sits inside a buffer we expanded.
-    return RunPipeline(in_data, effect_params.settings, input_world, 0, 0, output,
-                       -static_cast<int>(in_data->output_origin_x), -static_cast<int>(in_data->output_origin_y),
-                       depth);
+    return RunPipeline(in_data, effect_params.settings, MakeHostImage(input_world, depth), 0, 0,
+                       MakeHostImage(output, depth), -static_cast<int>(in_data->output_origin_x),
+                       -static_cast<int>(in_data->output_origin_y));
 }
 
 }  // namespace cosmic

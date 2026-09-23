@@ -41,7 +41,10 @@ struct UiValues {
     float turbulence_size_pct = 40.0f;
     float complexity = 3.0f;
     float evolution_deg = 0.0f;
-    bool evolve_with_angle = true;
+    // Off by default, so turning the Angle does not also set the noise moving;
+    // switch it on to make one keyframed angle a seamless loop. Projects saved
+    // with v1.0 keep the value they were saved with.
+    bool evolve_with_angle = false;
     int seed = 0;
 
     // Focus. Radius and falloff are in percent of the layer height: focus is
@@ -75,6 +78,9 @@ struct UiValues {
     float opacity_pct = 100.0f;
     bool expand_bounds = true;
     int working_space = 1;
+
+    // Performance.
+    bool gpu = true;
 };
 
 // Default positions of the point controls, in percent of the layer.

@@ -89,13 +89,20 @@ enum ParamIndex {
     kParamAboutGroupStart = 65,
     kParamAboutGroupEnd = 66,
 
-    kParamCount = 67
+    // Appended in v1.1. Everything above is the v1.0 layout and must stay put:
+    // saved projects find their values by these positions and ids.
+    kParamPerformanceGroupStart = 67,
+    kParamGpu = 68,
+    kParamPerformanceGroupEnd = 69,
+
+    kParamCount = 70
 };
 
 PF_Err SetupParams(PF_InData* in_data, PF_OutData* out_data);
 
 struct EffectParams {
     CosmicSettings settings;
+    bool gpu = true;
     bool expand_bounds = true;
     bool animate_grain = false;
     float grain = 0.0f;

@@ -8,8 +8,10 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-`core` runs the unit tests, `plugin` runs the mock host against the built
-`.aex` (Windows builds, or the mingw build through wine).
+`core` runs the unit tests, `gpu` the CUDA kernels through the emulator
+against the CPU renderer, `ptx_up_to_date` checks the embedded PTX, and
+`plugin` runs the mock host against the built `.aex`, with the stand-in CUDA
+driver (Windows builds, or the mingw build through wine).
 
 ### Sanitizers
 
@@ -36,7 +38,7 @@ things only the real host can tell you.
    apply **Effect ▸ AB Tools ▸ Cosmic Gradient** to a text layer. No warning
    triangle in Effect Controls (that would mean After Effects does not consider
    the effect thread safe).
-2. **The right build.** The last group is named `v1.0.0 (<commit>)`. After
+2. **The right build.** The group before *Performance* is named `v1.1.0 (<commit>)`. After
    Effects scans both its own `Plug-ins` folder and
    `Common\Plug-ins\7.0\MediaCore`; a stale copy in the other one wins.
 3. **Palettes.** Pick each palette: the five colours update. Edit a colour: the
@@ -61,3 +63,27 @@ things only the real host can tell you.
     render concurrently without artefacts.
 13. **Stability.** Apply and remove the effect 20 times, undo/redo, duplicate
     the layer, save, reopen. Memory returns to where it was.
+
+### GPU (NVIDIA)
+
+14. **The GPU is used.** With *Project Settings ▸ Video Rendering and Effects ▸
+    Mercury GPU Acceleration (CUDA)*, the effect shows the GPU badge in the
+    Effects & Presets panel, and scrubbing a defocused, turbulent 4K comp is
+    clearly faster than with *Mercury Software Only*.
+15. **Same frame.** Render one frame with CUDA and one with Software Only and
+    difference them (a *Difference* blend of the two renders): black, apart
+    from invisible rounding.
+16. **GPU Acceleration off.** *Performance ▸ GPU Acceleration* off renders that
+    instance on the CPU and still looks the same.
+17. **Bit depths on the GPU.** Repeat 15 in 8, 16 and 32 bpc. If a GPU render
+    is off in colour in 8 or 16 bpc, note it and set *Working Space* to sRGB.
+18. **Big frames.** A 6K or 8K comp with a large glow and defocus renders
+    (falling back to the CPU if the card runs out of memory) rather than
+    failing.
+
+### Old projects
+
+19. **A v1.0 project.** Open a project saved with v1.0: every control shows the
+    value it was saved with, and the frames match v1.0's renders (only
+    full-frame layers may differ, very slightly, within a blur's reach of the
+    frame edge).

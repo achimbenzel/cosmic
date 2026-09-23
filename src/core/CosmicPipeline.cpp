@@ -6,240 +6,12 @@
 
 #include "ImageF.h"
 #include "Noise.h"
+#include "Plan.h"
 #include "Pyramid.h"
 #include "Transfer.h"
 
 namespace cosmic {
 namespace {
-
-constexpr float kOpaque = 0.999f;
-constexpr float kTransparent = 1.0e-6f;
-constexpr float kTwoPi = 6.28318530717958647f;
-
-// A full-frame matte is padded by this much at most, so blurs near the frame
-// edge see the gradient carry on rather than a black border. Beyond it the
-// widest glow levels are already too faint to shade the edge visibly.
-constexpr int kMaxInternalPad = 512;
-
-// Glow, diffusion and defocus bounds: measured, a glow falls below a
-// thousandth of its value next to the source within 3.0 to 3.6 sigma of its
-// widest level, so this keeps everything visible inside the bounds without
-// rendering far more empty canvas than needed.
-constexpr float kReachSigmas = 3.4f;
-constexpr float kReachMargin = 8.0f;
-
-// Diffusion is a veil rather than a bloom: its levels are weighted a little
-// towards the fine end, like the scatter of a mist filter.
-constexpr float kDiffusionFalloff = 2.3f;
-
-inline float Fract(float v) { return v - std::floor(v); }
-
-inline float Smoothstep(float x) {
-    if (x <= 0.0f) return 0.0f;
-    if (x >= 1.0f) return 1.0f;
-    return x * x * (3.0f - 2.0f * x);
-}
-
-// ---------------------------------------------------------------------------
-// Blur plans shared by the glow, the diffusion and the bounds.
-// ---------------------------------------------------------------------------
-
-struct BlurPlan {
-    int levels = 0;                               // pyramid levels 1..levels
-    float weights[kMaxPyramidLevels + 1] = {};    // indexed by level
-    float reach = 0.0f;                           // render px
-};
-
-// Spreads a blur of the given sigma over pyramid levels whose weights follow a
-// 1/r^falloff point spread: a Gaussian of sigma s has its peak at 1/s^2, so a
-// level weighted s^(2 - falloff) contributes s^-falloff at its own scale. The
-// top level fades in with the fractional part of the size, so animating the
-// radius is continuous. Weights sum to one: the blur moves light, it does not
-// make any.
-BlurPlan MakeBlurPlan(float sigma, float falloff, int max_levels) {
-    BlurPlan plan;
-    if (!(sigma > 0.0f) || max_levels <= 0) return plan;
-    const float first = PyramidLevelSigma(1);
-    float position = sigma > first ? 1.0f + std::log2(sigma / first) : 1.0f;
-    int top = static_cast<int>(std::ceil(position - 1.0e-4f));
-    top = std::clamp(top, 1, std::min(max_levels, kMaxPyramidLevels));
-    const float top_weight = std::clamp(position - static_cast<float>(top - 1), 0.05f, 1.0f);
-
-    float sum = 0.0f;
-    for (int k = 1; k <= top; ++k) {
-        float w = std::pow(PyramidLevelSigma(k), 2.0f - falloff);
-        if (k == top) w *= top_weight;
-        plan.weights[k] = w;
-        sum += w;
-    }
-    for (int k = 1; k <= top; ++k) plan.weights[k] /= sum;
-    plan.levels = top;
-    plan.reach = kReachSigmas * PyramidLevelSigma(top) + kReachMargin;
-    return plan;
-}
-
-// Levels needed so the coarsest one is at least `sigma` wide.
-int LevelsForSigma(float sigma) {
-    int k = 0;
-    while (k < kMaxPyramidLevels && PyramidLevelSigma(k) < sigma) ++k;
-    return k;
-}
-
-// ---------------------------------------------------------------------------
-// Gradient field
-// ---------------------------------------------------------------------------
-
-struct Field {
-    GradientType type = GradientType::kLinear;
-    float cx = 0.0f, cy = 0.0f;
-    float dx = 0.0f, dy = 1.0f;  // along the gradient
-    float ex = 1.0f, ey = 0.0f;  // across it
-    float inv_span = 1.0f;
-    float inv_half_span = 2.0f;
-    float cycles = 1.0f;
-    float offset = 0.0f;
-    RepeatMode repeat = RepeatMode::kNone;
-
-    DepthShape depth_shape = DepthShape::kDome;
-    float depth = 0.0f;
-    float depth_x = 0.0f, depth_y = 0.0f;
-    float inv_depth_radius = 1.0f;
-};
-
-// Where the point controls land on the reference box: the layer's frame is
-// mapped proportionally onto it, so a control at the layer's centre sits at
-// the centre of the content.
-struct BoxMapping {
-    float sx = 1.0f, sy = 1.0f, ox = 0.0f, oy = 0.0f;
-    float X(float x) const { return ox + x * sx; }
-    float Y(float y) const { return oy + y * sy; }
-};
-
-BoxMapping MakeBoxMapping(const CosmicSettings& s, const ReferenceBox& box) {
-    BoxMapping m;
-    if (s.layer_width > 0.0f && s.layer_height > 0.0f) {
-        m.sx = box.width / s.layer_width;
-        m.sy = box.height / s.layer_height;
-    }
-    m.ox = box.x0;
-    m.oy = box.y0;
-    return m;
-}
-
-Field MakeField(const CosmicSettings& s, const ReferenceBox& box) {
-    Field f;
-    const BoxMapping map = MakeBoxMapping(s, box);
-    const float w = std::max(1.0f, box.width);
-    const float h = std::max(1.0f, box.height);
-    f.type = s.type;
-    f.cx = map.X(s.center_x);
-    f.cy = map.Y(s.center_y);
-    // After Effects angles: 0 is up, clockwise positive, y down.
-    f.dx = std::sin(s.angle);
-    f.dy = -std::cos(s.angle);
-    f.ex = -f.dy;
-    f.ey = f.dx;
-
-    // Size 1 makes one palette length span the box: like CSS, a linear ramp
-    // covers the box's extent along its own direction, a radial one reaches
-    // the corners.
-    const float along = std::fabs(w * f.dx) + std::fabs(h * f.dy);
-    const float across = std::fabs(w * f.ex) + std::fabs(h * f.ey);
-    float extent;
-    switch (s.type) {
-        case GradientType::kRadial: extent = std::sqrt(w * w + h * h); break;
-        case GradientType::kDiamond: extent = along + across; break;
-        case GradientType::kLinear:
-        case GradientType::kReflected:
-        case GradientType::kConic:
-        default: extent = along; break;
-    }
-    const float span = std::max(1.0e-3f, s.size * extent);
-    f.inv_span = 1.0f / span;
-    f.inv_half_span = 2.0f / span;
-    f.cycles = s.cycles;
-    f.offset = s.offset;
-    f.repeat = s.repeat;
-    f.depth_shape = s.depth_shape;
-    f.depth = s.depth;
-    f.depth_x = map.X(s.depth_x);
-    f.depth_y = map.Y(s.depth_y);
-    f.inv_depth_radius = 1.0f / std::max(1.0e-3f, s.depth_radius * std::max(w, h));
-    return f;
-}
-
-inline float FieldValue(const Field& f, float x, float y) {
-    const float px = x - f.cx;
-    const float py = y - f.cy;
-    const float u = px * f.dx + py * f.dy;
-    const float v = px * f.ex + py * f.ey;
-
-    float t;
-    switch (f.type) {
-        case GradientType::kRadial:
-            t = std::sqrt(px * px + py * py) * f.inv_half_span;
-            break;
-        case GradientType::kConic:
-            // Starts at the angle's direction and sweeps clockwise.
-            t = std::atan2(v, u) * (1.0f / kTwoPi);
-            if (t < 0.0f) t += 1.0f;
-            break;
-        case GradientType::kDiamond:
-            t = (std::fabs(u) + std::fabs(v)) * f.inv_half_span;
-            break;
-        case GradientType::kReflected:
-            t = std::fabs(u) * f.inv_half_span;
-            break;
-        case GradientType::kLinear:
-        default:
-            t = u * f.inv_span + 0.5f;
-            break;
-    }
-
-    if (f.depth != 0.0f) {
-        const float qx = (x - f.depth_x) * f.inv_depth_radius;
-        const float qy = (y - f.depth_y) * f.inv_depth_radius;
-        float h = 0.0f;
-        switch (f.depth_shape) {
-            case DepthShape::kSphere: {
-                const float r2 = qx * qx + qy * qy;
-                h = r2 < 1.0f ? std::sqrt(1.0f - r2) : 0.0f;
-                break;
-            }
-            case DepthShape::kRidge: {
-                const float w = qx * f.ex + qy * f.ey;
-                const float w2 = w * w;
-                h = w2 < 1.0f ? (1.0f - w2) * (1.0f - w2) : 0.0f;
-                break;
-            }
-            case DepthShape::kWave:
-                h = std::sin(kTwoPi * (qx * f.ex + qy * f.ey));
-                break;
-            case DepthShape::kDome:
-            default: {
-                const float r2 = qx * qx + qy * qy;
-                h = r2 < 1.0f ? (1.0f - r2) * (1.0f - r2) : 0.0f;
-                break;
-            }
-        }
-        t += f.depth * h;
-    }
-
-    t = t * f.cycles + f.offset;
-    switch (f.repeat) {
-        case RepeatMode::kRepeat:
-            return Fract(t);
-        case RepeatMode::kMirror: {
-            const float m = Fract(t * 0.5f) * 2.0f;
-            return m <= 1.0f ? m : 2.0f - m;
-        }
-        case RepeatMode::kNone:
-        default:
-            // A conic gradient has no ends to clamp to.
-            if (f.type == GradientType::kConic) return Fract(t);
-            return std::clamp(t, 0.0f, 1.0f);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Turbulence: a coarse grid of displacement vectors, reconstructed with the
@@ -251,40 +23,19 @@ class WarpGrid {
 public:
     bool Active() const { return active_; }
 
-    void Build(const CosmicSettings& s, const ReferenceBox& box, const CosmicRender& r, int canvas_left,
-               int canvas_top, int width, int height, TaskRunner& runner) {
-        const float shorter = std::max(1.0f, std::min(box.width, box.height));
-        const float turbulence = s.turbulence * shorter;
-        const float turbulence_size = s.turbulence_size * shorter;
-        active_ = turbulence > 0.0f && turbulence_size > 0.0f;
+    void Build(const WarpPlan& plan, const CosmicRender& r, int canvas_left, int canvas_top, TaskRunner& runner) {
+        active_ = plan.active;
         if (!active_) return;
-        const float size_render = turbulence_size * r.blur_scale;
-        const float finest = size_render / std::ldexp(1.0f, static_cast<int>(std::ceil(s.complexity)) - 1);
-        step_ = std::clamp(static_cast<int>(finest * 0.25f), 1, 16);
-        nx_ = width / step_ + 5;
-        ny_ = height / step_ + 5;
+        step_ = plan.step;
+        nx_ = plan.nx;
+        ny_ = plan.ny;
         data_.assign(static_cast<std::size_t>(nx_) * static_cast<std::size_t>(ny_) * 2, 0.0f);
-
-        FbmSettings fbm;
-        fbm.octaves = s.complexity;
-        fbm.seed = Hash32(s.seed * 0x9e3779b9u + 0x85ebca6bu);
-        FbmSettings fbm2 = fbm;
-        fbm2.seed = Hash32(fbm.seed ^ 0x5bd1e995u);
-        const float inv_size = 1.0f / turbulence_size;
-        // Fractal noise sits well inside [-1, 1]; this brings its typical
-        // swing up to about the displacement asked for.
-        const float amount = turbulence * 1.6f;
-
         ParallelRows(runner, ny_, [&](int begin, int end, int) {
             for (int j = begin; j < end; ++j) {
-                const float py = (static_cast<float>(canvas_top + (j - 2) * step_) + 0.5f) * r.to_full_y;
                 for (int i = 0; i < nx_; ++i) {
-                    const float px = (static_cast<float>(canvas_left + (i - 2) * step_) + 0.5f) * r.to_full_x;
-                    const float qx = px * inv_size;
-                    const float qy = py * inv_size;
-                    float* out = &data_[(static_cast<std::size_t>(j) * nx_ + i) * 2];
-                    out[0] = amount * LoopingFbm(qx, qy, s.evolution, fbm);
-                    out[1] = amount * LoopingFbm(qx + 31.416f, qy - 47.853f, s.evolution, fbm2);
+                    WarpNode(i, j, step_, canvas_left, canvas_top, r.to_full_x, r.to_full_y, plan.inv_size,
+                             plan.amount, plan.evolution, plan.fbm, plan.fbm2,
+                             &data_[(static_cast<std::size_t>(j) * nx_ + i) * 2]);
                 }
             }
         });
@@ -336,171 +87,11 @@ private:
 // Pixel helpers
 // ---------------------------------------------------------------------------
 
-inline PixelF LinearizePremultiplied(const PixelF& p, const TransferFunction& transfer) {
-    if (transfer.IsIdentity()) return p;
-    if (p.a >= kOpaque) return PixelF{p.a, transfer.Decode(p.r), transfer.Decode(p.g), transfer.Decode(p.b)};
-    if (p.a <= kTransparent) return PixelF{p.a, 0.0f, 0.0f, 0.0f};
-    const float inv = 1.0f / p.a;
-    return PixelF{p.a, transfer.Decode(p.r * inv) * p.a, transfer.Decode(p.g * inv) * p.a,
-                  transfer.Decode(p.b * inv) * p.a};
-}
-
-inline float ScreenChannel(float a, float b) {
-    constexpr float kKnee = 0.75f;
-    return a + b - SoftSaturate(a, kKnee) * SoftSaturate(b, kKnee);
-}
-
-inline float OverlayChannel(float base, float top) {
-    const TransferFunction& srgb = TransferFunction::Srgb();
-    const float a = std::clamp(srgb.Encode(base), 0.0f, 1.0f);
-    const float b = std::clamp(srgb.Encode(top), 0.0f, 1.0f);
-    const float o = a < 0.5f ? 2.0f * a * b : 1.0f - 2.0f * (1.0f - a) * (1.0f - b);
-    return srgb.Decode(o);
-}
-
-// The gradient's colour once combined with the layer's own (unpremultiplied,
-// linear) colour.
-inline Rgb BlendColor(BlendMode mode, const Rgb& s, const Rgb& g) {
-    switch (mode) {
-        case BlendMode::kMultiply:
-            return Rgb{s.r * g.r, s.g * g.g, s.b * g.b};
-        case BlendMode::kScreen:
-            return Rgb{ScreenChannel(s.r, g.r), ScreenChannel(s.g, g.g), ScreenChannel(s.b, g.b)};
-        case BlendMode::kOverlay:
-            return Rgb{OverlayChannel(s.r, g.r), OverlayChannel(s.g, g.g), OverlayChannel(s.b, g.b)};
-        case BlendMode::kColor: {
-            // The layer's lightness with the gradient's hue and chroma: keeps
-            // the shading of text bevels and footage.
-            const Lab ls = LinearSrgbToOklab(Rgb{std::max(0.0f, s.r), std::max(0.0f, s.g), std::max(0.0f, s.b)});
-            const Lab lg = LinearSrgbToOklab(g);
-            const Rgb out = OklabToLinearSrgb(Lab{ls.l, lg.a, lg.b});
-            return Rgb{std::max(0.0f, out.r), std::max(0.0f, out.g), std::max(0.0f, out.b)};
-        }
-        case BlendMode::kNormal:
-        default:
-            return g;
-    }
-}
-
-inline float MatteValue(MatteMode mode, float source_alpha) {
-    switch (mode) {
-        case MatteMode::kInvertedAlpha: return 1.0f - std::clamp(source_alpha, 0.0f, 1.0f);
-        case MatteMode::kFullFrame: return 1.0f;
-        case MatteMode::kLayerAlpha:
-        default: return std::clamp(source_alpha, 0.0f, 1.0f);
-    }
-}
-
-// Soft-knee highlight isolation on the pixel's own (unpremultiplied)
-// brightness, so an anti-aliased edge emits in proportion to its coverage.
-struct GlowThreshold {
-    float level = 0.0f;
-    float knee = 0.0f;
-};
-
-inline PixelF ExtractHighlight(const PixelF& p, const GlowThreshold& threshold) {
-    if (p.a <= kTransparent) return PixelF{0.0f, 0.0f, 0.0f, 0.0f};
-    const float inv = p.a >= kOpaque ? 1.0f : 1.0f / p.a;
-    const float level = std::max(p.r, std::max(p.g, p.b)) * inv;
-    if (level <= 0.0f) return PixelF{0.0f, 0.0f, 0.0f, 0.0f};
-    float above = level - threshold.level;
-    if (threshold.knee > 0.0f) {
-        float soft = std::clamp(above + threshold.knee, 0.0f, 2.0f * threshold.knee);
-        soft = soft * soft / (4.0f * threshold.knee);
-        above = std::max(soft, above);
-    }
-    if (above <= 0.0f) return PixelF{0.0f, 0.0f, 0.0f, 0.0f};
-    const float c = above / level;
-    return PixelF{p.a * c, p.r * c, p.g * c, p.b * c};
-}
-
-// Film grain: a hashed value per grain cell, interpolated, so grain larger
-// than a pixel is soft rather than blocky. Keyed to full-resolution layer
-// coordinates, so it holds still under downsampling and moving bounds.
-inline float GrainValue(float x, float y, float inv_size, std::uint32_t seed) {
-    const float gx = x * inv_size;
-    const float gy = y * inv_size;
-    const float fx = std::floor(gx);
-    const float fy = std::floor(gy);
-    const int ix = static_cast<int>(fx);
-    const int iy = static_cast<int>(fy);
-    const float tx = Smoothstep(gx - fx);
-    const float ty = Smoothstep(gy - fy);
-    const float n00 = TriangularNoise(ix, iy, seed);
-    const float n10 = TriangularNoise(ix + 1, iy, seed);
-    const float n01 = TriangularNoise(ix, iy + 1, seed);
-    const float n11 = TriangularNoise(ix + 1, iy + 1, seed);
-    const float top = n00 + (n10 - n00) * tx;
-    const float bottom = n01 + (n11 - n01) * tx;
-    // Interpolation lowers the variance; this brings it back to about that of
-    // a single cell.
-    return (top + (bottom - top) * ty) * 1.35f;
-}
-
 inline float Quantize(float value, float max_value, float dither) {
     const float scaled = value * max_value + dither;
     if (!(scaled > 0.0f)) return 0.0f;
     if (scaled >= max_value) return max_value;
     return std::floor(scaled + 0.5f);
-}
-
-struct OutputContext {
-    const TransferFunction* transfer = nullptr;  // working space encoding
-    PixelDepth depth = PixelDepth::kBits8;
-    float protection_knee = 1.0f;
-    bool protect = false;
-    float grain = 0.0f;
-    float grain_inv_size = 1.0f;
-    std::uint32_t grain_seed = 0;
-    float to_full_x = 1.0f;
-    float to_full_y = 1.0f;
-};
-
-// Linear premultiplied light to the working space's encoding, with highlight
-// protection and grain. Returns a premultiplied pixel.
-inline PixelF FinishPixel(const PixelF& c, const OutputContext& ctx, int lx, int ly) {
-    const float a = std::clamp(c.a, 0.0f, 1.0f);
-    if (a <= kTransparent) return PixelF{0.0f, 0.0f, 0.0f, 0.0f};
-    const float inv = 1.0f / a;
-    float r = std::max(0.0f, c.r * inv);
-    float g = std::max(0.0f, c.g * inv);
-    float b = std::max(0.0f, c.b * inv);
-
-    if (ctx.protect) {
-        // Rolls the brightest channel off and scales the others with it, so a
-        // colour approaching the top of the range keeps its hue instead of
-        // clipping channel by channel towards white.
-        const float m = std::max(r, std::max(g, b));
-        if (m > ctx.protection_knee) {
-            const float scale = SoftSaturate(m, ctx.protection_knee) / m;
-            r *= scale;
-            g *= scale;
-            b *= scale;
-        }
-    }
-
-    const TransferFunction& srgb = TransferFunction::Srgb();
-    const bool encode_srgb = !ctx.transfer->IsIdentity();
-    if (ctx.grain > 0.0f) {
-        // Grain lives in perceptual units, strongest in the midtones like film.
-        float er = srgb.Encode(r);
-        float eg = srgb.Encode(g);
-        float eb = srgb.Encode(b);
-        const float mean = std::clamp((er + eg + eb) * (1.0f / 3.0f), 0.0f, 1.0f);
-        const float response = 0.35f + 2.6f * mean * (1.0f - mean);
-        const float n = GrainValue((static_cast<float>(lx) + 0.5f) * ctx.to_full_x,
-                                   (static_cast<float>(ly) + 0.5f) * ctx.to_full_y, ctx.grain_inv_size,
-                                   ctx.grain_seed) *
-                        ctx.grain * 0.18f * response;
-        er = std::max(0.0f, er + n);
-        eg = std::max(0.0f, eg + n);
-        eb = std::max(0.0f, eb + n);
-        if (encode_srgb) return PixelF{a, er * a, eg * a, eb * a};
-        return PixelF{a, srgb.Decode(er) * a, srgb.Decode(eg) * a, srgb.Decode(eb) * a};
-    }
-
-    if (encode_srgb) return PixelF{a, srgb.Encode(r) * a, srgb.Encode(g) * a, srgb.Encode(b) * a};
-    return PixelF{a, r * a, g * a, b * a};
 }
 
 void StorePixel(void* row, int x, const PixelF& p, PixelDepth depth, float dither) {
@@ -536,14 +127,8 @@ void StorePixel(void* row, int x, const PixelF& p, PixelDepth depth, float dithe
 }
 
 const TransferFunction& WorkingTransfer(WorkingSpace space, PixelDepth depth) {
-    switch (space) {
-        case WorkingSpace::kLinear: return TransferFunction::Identity();
-        case WorkingSpace::kSrgb: return TransferFunction::Srgb();
-        case WorkingSpace::kAuto:
-        default:
-            // The usual setups: 32 bpc projects are linearised, 8 and 16 are not.
-            return depth == PixelDepth::kFloat32 ? TransferFunction::Identity() : TransferFunction::Srgb();
-    }
+    return IsLinearWorkingSpace(space, depth == PixelDepth::kFloat32) ? TransferFunction::Identity()
+                                                                       : TransferFunction::Srgb();
 }
 
 }  // namespace
@@ -553,17 +138,12 @@ float GradientCoordinate(const CosmicSettings& settings, const ReferenceBox& box
 }
 
 ReferenceBox FindReferenceBox(const CosmicSettings& settings, const CosmicRender& render) {
-    ReferenceBox layer;
-    layer.width = settings.layer_width;
-    layer.height = settings.layer_height;
     const HostImage& source = render.source;
-    if (settings.fit != FitMode::kContentBounds || settings.matte != MatteMode::kLayerAlpha || source.Empty()) {
-        return layer;
+    if (!WantsContentBounds(settings) || source.Empty()) {
+        return BoxFromSourceBounds(settings, 0, -1, 0, -1, 0, 0, 1.0f, 1.0f);
     }
-
     // Anything below half an 8-bit step is treated as empty, so faint
     // anti-aliasing or a soft shadow does not stretch the box.
-    constexpr float kVisible = 0.5f / 255.0f;
     int x0 = source.width;
     int x1 = -1;
     int y0 = source.height;
@@ -572,7 +152,7 @@ ReferenceBox FindReferenceBox(const CosmicSettings& settings, const CosmicRender
         const void* row = source.ConstRow(y);
         int first = -1;
         for (int x = 0; x < source.width; ++x) {
-            if (ReadHostPixel(source, row, x).a > kVisible) {
+            if (ReadHostPixel(source, row, x).a > kVisibleAlpha) {
                 first = x;
                 break;
             }
@@ -580,7 +160,7 @@ ReferenceBox FindReferenceBox(const CosmicSettings& settings, const CosmicRender
         if (first < 0) continue;
         int last = first;
         for (int x = source.width - 1; x > first; --x) {
-            if (ReadHostPixel(source, row, x).a > kVisible) {
+            if (ReadHostPixel(source, row, x).a > kVisibleAlpha) {
                 last = x;
                 break;
             }
@@ -590,30 +170,24 @@ ReferenceBox FindReferenceBox(const CosmicSettings& settings, const CosmicRender
         y0 = std::min(y0, y);
         y1 = y;
     }
-    if (x1 < x0 || y1 < y0) return layer;
-
-    ReferenceBox box;
-    box.x0 = static_cast<float>(x0 + render.source_left) * render.to_full_x;
-    box.y0 = static_cast<float>(y0 + render.source_top) * render.to_full_y;
-    box.width = static_cast<float>(x1 - x0 + 1) * render.to_full_x;
-    box.height = static_cast<float>(y1 - y0 + 1) * render.to_full_y;
-    return box;
+    return BoxFromSourceBounds(settings, x0, x1, y0, y1, render.source_left, render.source_top, render.to_full_x,
+                               render.to_full_y);
 }
 
 float EffectReach(const CosmicSettings& s, float blur_scale) {
-    float reach = 0.0f;
+    float spread = 0.0f;
     if (s.glow_intensity > 0.0f && s.glow_radius > 0.0f) {
-        reach = std::max(reach, MakeBlurPlan(s.glow_radius * blur_scale * 0.5f, s.glow_falloff, kMaxPyramidLevels).reach);
+        spread = std::max(spread,
+                          MakeBlurPlan(s.glow_radius * blur_scale * 0.5f, s.glow_falloff, kMaxPyramidLevels).reach);
     }
     if (s.diffusion > 0.0f && s.diffusion_radius > 0.0f) {
-        reach = std::max(
-            reach, MakeBlurPlan(s.diffusion_radius * blur_scale * 0.5f, kDiffusionFalloff, kMaxPyramidLevels).reach);
+        spread = std::max(
+            spread, MakeBlurPlan(s.diffusion_radius * blur_scale * 0.5f, kDiffusionFalloff, kMaxPyramidLevels).reach);
     }
-    if (s.defocus > 0.0f) {
-        const int levels = LevelsForSigma(s.defocus * blur_scale);
-        reach += kReachSigmas * PyramidLevelSigma(levels) + kReachMargin;
-    }
-    return reach;
+    const float defocus = s.defocus > 0.0f ? DefocusReach(s.defocus * blur_scale) : 0.0f;
+    // The glow and the veil spread the already defocused image, and blurs in
+    // sequence add like Gaussians: in quadrature.
+    return std::sqrt(spread * spread + defocus * defocus);
 }
 
 CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& render, Allocator& allocator,
@@ -631,16 +205,16 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
     const ReferenceBox box = FindReferenceBox(settings, render);
     const Field field = MakeField(settings, box);
 
-    // Canvas: the output, padded where the matte carries on past the layer.
-    const float reach = EffectReach(settings, render.blur_scale);
-    const int pad = CanExpand(settings) ? 0 : std::min(kMaxInternalPad, static_cast<int>(std::ceil(reach)));
-    const int width = dest.width + 2 * pad;
-    const int height = dest.height + 2 * pad;
-    const int canvas_left = render.dest_left - pad;
-    const int canvas_top = render.dest_top - pad;
+    // The canvas is the output. Where the matte fills the layer edge to edge,
+    // the blurs carry the edge on instead of fading into a black border.
+    const int width = dest.width;
+    const int height = dest.height;
+    const int canvas_left = render.dest_left;
+    const int canvas_top = render.dest_top;
+    const BorderMode border = CanExpand(settings) ? BorderMode::kZero : BorderMode::kClamp;
 
     WarpGrid warp;
-    warp.Build(settings, box, render, canvas_left, canvas_top, width, height, runner);
+    warp.Build(MakeWarpPlan(settings, box, render.blur_scale, width, height), render, canvas_left, canvas_top, runner);
 
     // --- 1. The gradient, matted and blended with the layer ----------------
     OwnedImageF base;
@@ -662,7 +236,8 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
                     const int last = std::min(width, render.source_left + source.width - canvas_left);
                     for (int cx = first; cx < last; ++cx) {
                         src_row[static_cast<std::size_t>(cx)] = LinearizePremultiplied(
-                            ReadHostPixel(source, row, canvas_left + cx - render.source_left), transfer);
+                            ReadHostPixel(source, row, canvas_left + cx - render.source_left), transfer,
+                            transfer.IsIdentity());
                     }
                 }
                 if (warp.Active()) warp.Row(cy, warp_row.data());
@@ -689,7 +264,8 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
                     Rgb color = lut.Sample(FieldValue(field, x, y));
                     if (settings.blend != BlendMode::kNormal) {
                         const float inv = src.a > kTransparent ? 1.0f / src.a : 0.0f;
-                        color = BlendColor(settings.blend, Rgb{src.r * inv, src.g * inv, src.b * inv}, color);
+                        color = BlendColor(settings.blend, Rgb{src.r * inv, src.g * inv, src.b * inv}, color,
+                                           TransferFunction::Srgb());
                     }
                     const float keep = 1.0f - opacity;
                     const float m = matte * opacity;
@@ -707,23 +283,45 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
         const int levels = std::min(LevelsForSigma(defocus), MaxUsefulLevels(width, height));
         Pyramid pyramid;
         const ImageF& b = base.View();
-        if (!pyramid.Build(allocator, runner, width, height, levels, [&](int y, PixelF* out) {
-                const PixelF* in = b.Row(y);
-                std::copy(in, in + width, out);
-            })) {
+        if (!pyramid.Build(
+                allocator, runner, width, height, levels,
+                [&](int y, PixelF* out) {
+                    const PixelF* in = b.Row(y);
+                    std::copy(in, in + width, out);
+                },
+                border)) {
             return CosmicResult::kOutOfMemory;
         }
         if (!focused.Allocate(allocator, width, height)) return CosmicResult::kOutOfMemory;
         ImageF& f = focused.View();
         const int top = pyramid.Count();
-        float sigmas[kMaxPyramidLevels + 1];
+        float sigmas[kMaxPyramidLevels + 2];
         for (int k = 0; k <= top; ++k) sigmas[k] = PyramidLevelSigma(k);
+        sigmas[top + 1] = sigmas[top];
+        std::vector<BsplineRowSampler> samplers;
+        samplers.reserve(static_cast<std::size_t>(top));
+        for (int k = 1; k <= top; ++k) samplers.emplace_back(pyramid.Level(k), k, width, border);
         const float falloff = std::max(0.0f, settings.focus_falloff);
+
+        // Row by row: work out which levels each pixel blends, reconstruct
+        // just the spans of those levels the row needs, then mix. A pixel's
+        // blur is a mix of the two levels around its sigma.
         ParallelRows(runner, height, [&](int begin, int end, int) {
+            constexpr unsigned char kSharp = 0xFF;
+            std::vector<unsigned char> level_of(static_cast<std::size_t>(width));
+            std::vector<float> mix_of(static_cast<std::size_t>(width));
+            std::vector<PixelF> scratch(static_cast<std::size_t>(width));
+            std::vector<std::vector<PixelF>> rows(static_cast<std::size_t>(top) + 1);
+            for (auto& row : rows) row.resize(static_cast<std::size_t>(width));
+            int span_begin[kMaxPyramidLevels + 1];
+            int span_end[kMaxPyramidLevels + 1];
+
             for (int cy = begin; cy < end; ++cy) {
                 const float y = (static_cast<float>(canvas_top + cy) + 0.5f) * render.to_full_y - settings.focus_y;
-                const PixelF* in = b.Row(cy);
-                PixelF* out = f.Row(cy);
+                for (int k = 0; k <= top; ++k) {
+                    span_begin[k] = width;
+                    span_end[k] = 0;
+                }
                 for (int cx = 0; cx < width; ++cx) {
                     const float x =
                         (static_cast<float>(canvas_left + cx) + 0.5f) * render.to_full_x - settings.focus_x;
@@ -734,27 +332,45 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
                     } else if (falloff <= 0.0f) {
                         amount = 1.0f;
                     } else {
-                        amount = Smoothstep(d / falloff);
+                        amount = Smoothstep01(d / falloff);
                     }
                     const float sigma = defocus * amount;
                     if (sigma <= 0.02f || top == 0) {
-                        out[cx] = in[cx];
+                        level_of[cx] = kSharp;
                         continue;
                     }
                     int k = 0;
                     while (k < top && sigmas[k + 1] <= sigma) ++k;
-                    if (k >= top) {
-                        out[cx] = SampleLevel(pyramid.Level(top), top, static_cast<float>(cx), static_cast<float>(cy));
+                    const int hi = std::min(k + 1, top);
+                    level_of[cx] = static_cast<unsigned char>(k);
+                    mix_of[cx] = k >= top ? 1.0f : (sigma - sigmas[k]) / (sigmas[k + 1] - sigmas[k]);
+                    for (int level : {k, hi}) {
+                        if (level < 1) continue;
+                        span_begin[level] = std::min(span_begin[level], cx);
+                        span_end[level] = std::max(span_end[level], cx + 1);
+                    }
+                }
+                for (int k = 1; k <= top; ++k) {
+                    if (span_begin[k] < span_end[k]) {
+                        samplers[static_cast<std::size_t>(k - 1)].SampleRow(cy, scratch.data(), rows[k].data(),
+                                                                            span_begin[k], span_end[k]);
+                    }
+                }
+
+                const PixelF* in = b.Row(cy);
+                PixelF* out = f.Row(cy);
+                for (int cx = 0; cx < width; ++cx) {
+                    const int k = level_of[cx];
+                    if (k == kSharp) {
+                        out[cx] = in[cx];
                         continue;
                     }
-                    const float t = (sigma - sigmas[k]) / (sigmas[k + 1] - sigmas[k]);
-                    const PixelF lo = k == 0 ? in[cx]
-                                             : SampleLevel(pyramid.Level(k), k, static_cast<float>(cx),
-                                                           static_cast<float>(cy));
-                    const PixelF hi =
-                        SampleLevel(pyramid.Level(k + 1), k + 1, static_cast<float>(cx), static_cast<float>(cy));
-                    out[cx] = PixelF{lo.a + (hi.a - lo.a) * t, lo.r + (hi.r - lo.r) * t, lo.g + (hi.g - lo.g) * t,
-                                     lo.b + (hi.b - lo.b) * t};
+                    const int hi = std::min(k + 1, top);
+                    const PixelF& lo = k == 0 ? in[cx] : rows[k][cx];
+                    const PixelF& up = rows[hi][cx];
+                    const float t = mix_of[cx];
+                    out[cx] = PixelF{lo.a + (up.a - lo.a) * t, lo.r + (up.r - lo.r) * t, lo.g + (up.g - lo.g) * t,
+                                     lo.b + (up.b - lo.b) * t};
                 }
             }
         });
@@ -770,17 +386,18 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
         const BlurPlan plan =
             MakeBlurPlan(settings.glow_radius * render.blur_scale * 0.5f, settings.glow_falloff, max_levels);
         if (plan.levels > 0) {
-            GlowThreshold threshold;
-            threshold.level = std::max(0.0f, settings.glow_threshold);
-            threshold.knee = std::clamp(settings.glow_softness, 0.0f, 1.0f) * std::max(threshold.level, 0.05f);
+            const GlowThreshold threshold = MakeGlowThreshold(settings);
             Pyramid pyramid;
-            if (!pyramid.Build(allocator, runner, width, height, plan.levels, [&](int y, PixelF* out) {
-                    const PixelF* in = image.Row(y);
-                    for (int x = 0; x < width; ++x) out[x] = ExtractHighlight(in[x], threshold);
-                })) {
+            if (!pyramid.Build(
+                    allocator, runner, width, height, plan.levels,
+                    [&](int y, PixelF* out) {
+                        const PixelF* in = image.Row(y);
+                        for (int x = 0; x < width; ++x) out[x] = ExtractHighlight(in[x], threshold);
+                    },
+                    border)) {
                 return CosmicResult::kOutOfMemory;
             }
-            if (!CollapsePyramid(allocator, runner, pyramid, plan.weights, 1, plan.levels, &glow)) {
+            if (!CollapsePyramid(allocator, runner, pyramid, plan.weights, 1, plan.levels, &glow, border)) {
                 return CosmicResult::kOutOfMemory;
             }
         }
@@ -793,29 +410,25 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
             MakeBlurPlan(settings.diffusion_radius * render.blur_scale * 0.5f, kDiffusionFalloff, max_levels);
         if (plan.levels > 0) {
             Pyramid pyramid;
-            if (!pyramid.Build(allocator, runner, width, height, plan.levels, [&](int y, PixelF* out) {
-                    const PixelF* in = image.Row(y);
-                    std::copy(in, in + width, out);
-                })) {
+            if (!pyramid.Build(
+                    allocator, runner, width, height, plan.levels,
+                    [&](int y, PixelF* out) {
+                        const PixelF* in = image.Row(y);
+                        std::copy(in, in + width, out);
+                    },
+                    border)) {
                 return CosmicResult::kOutOfMemory;
             }
-            if (!CollapsePyramid(allocator, runner, pyramid, plan.weights, 1, plan.levels, &diffusion)) {
+            if (!CollapsePyramid(allocator, runner, pyramid, plan.weights, 1, plan.levels, &diffusion, border)) {
                 return CosmicResult::kOutOfMemory;
             }
         }
     }
 
     // --- 4. Composite into the host buffer -----------------------------------
-    OutputContext ctx;
-    ctx.transfer = &transfer;
-    ctx.depth = dest.depth;
-    ctx.protect = settings.highlight_protection > 0.0f;
-    ctx.protection_knee = 1.0f - 0.6f * std::clamp(settings.highlight_protection, 0.0f, 1.0f);
-    ctx.grain = std::clamp(settings.grain, 0.0f, 1.0f);
-    ctx.grain_inv_size = 1.0f / std::max(0.05f, settings.grain_size);
-    ctx.grain_seed = Hash32(settings.grain_seed ^ 0x27d4eb2fu);
-    ctx.to_full_x = render.to_full_x;
-    ctx.to_full_y = render.to_full_y;
+    const FinishParams finish =
+        MakeFinishParams(settings, render.to_full_x, render.to_full_y, !transfer.IsIdentity());
+    const TransferFunction& srgb = TransferFunction::Srgb();
     const float intensity = std::max(0.0f, settings.glow_intensity);
     const bool dither = dest.depth != PixelDepth::kFloat32;
 
@@ -825,11 +438,11 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
     std::vector<BsplineRowSampler> samplers;
     samplers.reserve(2);
     if (glow.Valid()) {
-        samplers.emplace_back(glow.View(), 1, width);
+        samplers.emplace_back(glow.View(), 1, width, border);
         glow_sampler = &samplers.back();
     }
     if (diffusion.Valid()) {
-        samplers.emplace_back(diffusion.View(), 1, width);
+        samplers.emplace_back(diffusion.View(), 1, width, border);
         diffusion_sampler = &samplers.back();
     }
 
@@ -838,14 +451,14 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
         std::vector<PixelF> diffusion_row(diffusion_sampler ? static_cast<std::size_t>(width) : 0);
         std::vector<PixelF> scratch(static_cast<std::size_t>(width));
         for (int y = begin; y < end; ++y) {
-            const int cy = y + pad;
+            const int cy = y;
             if (glow_sampler) glow_sampler->SampleRow(cy, scratch.data(), glow_row.data());
             if (diffusion_sampler) diffusion_sampler->SampleRow(cy, scratch.data(), diffusion_row.data());
             const PixelF* in = image.Row(cy);
             void* out_row = dest.Row(y);
             const int ly = render.dest_top + y;
             for (int x = 0; x < dest.width; ++x) {
-                const int cx = x + pad;
+                const int cx = x;
                 PixelF c = in[cx];
                 if (diffusion_sampler) {
                     // The veil spreads light outwards and dims what it takes it
@@ -867,11 +480,11 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
                     c.a = ca + ga * (1.0f - ca);
                 }
                 const int lx = render.dest_left + x;
-                const PixelF encoded = FinishPixel(c, ctx, lx, ly);
+                const PixelF encoded = FinishPixel(c, finish, srgb, lx, ly);
                 // Triangular dither of one step decorrelates the quantisation error
                 // from the signal, so an 8-bit ramp shows noise instead of bands.
                 const float d = dither ? TriangularNoise(lx, ly, 0x51ed270bu) : 0.0f;
-                StorePixel(out_row, x, encoded, ctx.depth, d);
+                StorePixel(out_row, x, encoded, dest.depth, d);
             }
         }
     });

@@ -11,7 +11,7 @@ static_assert(COSMIC_OUT_FLAGS ==
               "PiPL out flags are out of sync with GlobalSetup");
 static_assert(COSMIC_OUT_FLAGS2 == (PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG | PF_OutFlag2_SUPPORTS_SMART_RENDER |
                                     PF_OutFlag2_FLOAT_COLOR_AWARE | PF_OutFlag2_SUPPORTS_THREADED_RENDERING |
-                                    PF_OutFlag2_SUPPORTS_QUERY_DYNAMIC_FLAGS),
+                                    PF_OutFlag2_SUPPORTS_QUERY_DYNAMIC_FLAGS | PF_OutFlag2_SUPPORTS_GPU_RENDER_F32),
               "PiPL out flags 2 are out of sync with GlobalSetup");
 
 namespace {
@@ -69,6 +69,15 @@ extern "C" DllExport PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutDat
                 break;
             case PF_Cmd_SMART_RENDER:
                 err = cosmic::SmartRender(in_data, out_data, static_cast<PF_SmartRenderExtra*>(extra));
+                break;
+            case PF_Cmd_GPU_DEVICE_SETUP:
+                err = cosmic::GpuDeviceSetup(in_data, out_data, static_cast<PF_GPUDeviceSetupExtra*>(extra));
+                break;
+            case PF_Cmd_GPU_DEVICE_SETDOWN:
+                err = cosmic::GpuDeviceSetdown(in_data, out_data, static_cast<PF_GPUDeviceSetdownExtra*>(extra));
+                break;
+            case PF_Cmd_SMART_RENDER_GPU:
+                err = cosmic::SmartRenderGpu(in_data, out_data, static_cast<PF_SmartRenderExtra*>(extra));
                 break;
             default:
                 break;

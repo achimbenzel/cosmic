@@ -6,9 +6,6 @@
 namespace cosmic {
 namespace {
 
-// Binomial (1 5 10 10 5 1) / 32: variance 1.25 in the finer level's pixels.
-constexpr float kReduceTaps[6] = {1.0f / 32.0f, 5.0f / 32.0f, 10.0f / 32.0f, 10.0f / 32.0f, 5.0f / 32.0f, 1.0f / 32.0f};
-
 inline void Madd(PixelF& acc, const PixelF& p, float w) {
     acc.a += p.a * w;
     acc.r += p.r * w;
@@ -16,18 +13,18 @@ inline void Madd(PixelF& acc, const PixelF& p, float w) {
     acc.b += p.b * w;
 }
 
-// dst[i] gathers src[2i - 2 .. 2i + 3].
-void ReduceRow(const PixelF* src, int width, PixelF* dst, int half_width) {
+// dst[i] gathers src[2i - 2 .. 2i + 3] with the binomial ReduceTap weights.
+void ReduceRow(const PixelF* src, int width, PixelF* dst, int half_width, BorderMode border) {
     for (int i = 0; i < half_width; ++i) {
         const int first = 2 * i - 2;
         PixelF acc{0.0f, 0.0f, 0.0f, 0.0f};
         if (first >= 0 && first + 5 < width) {
             const PixelF* s = src + first;
-            for (int m = 0; m < 6; ++m) Madd(acc, s[m], kReduceTaps[m]);
+            for (int m = 0; m < 6; ++m) Madd(acc, s[m], ReduceTap(m));
         } else {
             for (int m = 0; m < 6; ++m) {
-                const int x = first + m;
-                if (x >= 0 && x < width) Madd(acc, src[x], kReduceTaps[m]);
+                const int x = BorderIndex(first + m, width, border);
+                if (x >= 0) Madd(acc, src[x], ReduceTap(m));
             }
         }
         dst[i] = acc;
@@ -35,17 +32,17 @@ void ReduceRow(const PixelF* src, int width, PixelF* dst, int half_width) {
 }
 
 // Vertical half of the reduce: tmp holds `height` horizontally reduced rows.
-void ReduceColumns(const ImageF& tmp, int height, ImageF& dst, TaskRunner& runner) {
+void ReduceColumns(const ImageF& tmp, int height, ImageF& dst, TaskRunner& runner, BorderMode border) {
     ParallelRows(runner, dst.height, [&](int begin, int end, int) {
         for (int j = begin; j < end; ++j) {
             PixelF* out = dst.Row(j);
             std::fill(out, out + dst.width, PixelF{0.0f, 0.0f, 0.0f, 0.0f});
             const int first = 2 * j - 2;
             for (int m = 0; m < 6; ++m) {
-                const int y = first + m;
-                if (y < 0 || y >= height) continue;
+                const int y = BorderIndex(first + m, height, border);
+                if (y < 0) continue;
                 const PixelF* in = tmp.Row(y);
-                const float w = kReduceTaps[m];
+                const float w = ReduceTap(m);
                 for (int i = 0; i < dst.width; ++i) Madd(out[i], in[i], w);
             }
         }
@@ -71,7 +68,7 @@ int MaxUsefulLevels(int width, int height) {
 }
 
 bool Pyramid::Build(Allocator& allocator, TaskRunner& runner, int width, int height, int levels,
-                    const RowFn& level0_row) {
+                    const RowFn& level0_row, BorderMode border) {
     count_ = 0;
     levels = std::min(levels, kMaxPyramidLevels);
     if (levels <= 0 || width <= 0 || height <= 0) return true;
@@ -97,16 +94,16 @@ bool Pyramid::Build(Allocator& allocator, TaskRunner& runner, int width, int hei
                 std::vector<PixelF> row(static_cast<std::size_t>(w));
                 for (int y = begin; y < end; ++y) {
                     level0_row(y, row.data());
-                    ReduceRow(row.data(), w, tmp_view.Row(y), hw);
+                    ReduceRow(row.data(), w, tmp_view.Row(y), hw, border);
                 }
             });
         } else {
             const ImageF& src = levels_[k - 2].View();
             ParallelRows(runner, h, [&](int begin, int end, int) {
-                for (int y = begin; y < end; ++y) ReduceRow(src.Row(y), w, tmp_view.Row(y), hw);
+                for (int y = begin; y < end; ++y) ReduceRow(src.Row(y), w, tmp_view.Row(y), hw, border);
             });
         }
-        ReduceColumns(tmp_view, h, levels_[k - 1].View(), runner);
+        ReduceColumns(tmp_view, h, levels_[k - 1].View(), runner, border);
         count_ = k;
         w = hw;
         h = hh;
@@ -114,8 +111,8 @@ bool Pyramid::Build(Allocator& allocator, TaskRunner& runner, int width, int hei
     return true;
 }
 
-BsplineRowSampler::BsplineRowSampler(const ImageF& source, int scale_log2, int target_width)
-    : source_(source), inv_scale_(std::ldexp(1.0f, -scale_log2)), target_width_(target_width) {
+BsplineRowSampler::BsplineRowSampler(const ImageF& source, int scale_log2, int target_width, BorderMode border)
+    : source_(source), inv_scale_(std::ldexp(1.0f, -scale_log2)), target_width_(target_width), border_(border) {
     tap_index_.resize(static_cast<std::size_t>(target_width) * 4);
     tap_weight_.resize(static_cast<std::size_t>(target_width) * 4);
     for (int x = 0; x < target_width; ++x) {
@@ -125,42 +122,53 @@ BsplineRowSampler::BsplineRowSampler(const ImageF& source, int scale_log2, int t
         BsplineWeights(s - fl, w);
         const int i0 = static_cast<int>(fl) - 1;
         for (int t = 0; t < 4; ++t) {
-            const int i = i0 + t;
-            const bool inside = i >= 0 && i < source.width;
-            tap_index_[static_cast<std::size_t>(x) * 4 + t] = inside ? i : 0;
-            tap_weight_[static_cast<std::size_t>(x) * 4 + t] = inside ? w[t] : 0.0f;
+            // A tap with nothing under it keeps a valid, monotonic index and
+            // contributes nothing, so a range of columns maps to a range of taps.
+            const int i = BorderIndex(i0 + t, source.width, border);
+            tap_index_[static_cast<std::size_t>(x) * 4 + t] = i >= 0 ? i : Clampi(i0 + t, 0, source.width - 1);
+            tap_weight_[static_cast<std::size_t>(x) * 4 + t] = i >= 0 ? w[t] : 0.0f;
         }
     }
 }
 
-void BsplineRowSampler::SampleRow(int y, PixelF* scratch, PixelF* out) const {
+void BsplineRowSampler::SampleRow(int y, PixelF* scratch, PixelF* out, int x_begin, int x_end) const {
+    if (x_end < 0 || x_end > target_width_) x_end = target_width_;
+    if (x_begin < 0) x_begin = 0;
+    if (x_begin >= x_end) return;
+
     const float s = (static_cast<float>(y) + 0.5f) * inv_scale_ - 0.5f;
     const float fl = std::floor(s);
     float w[4];
     BsplineWeights(s - fl, w);
     const int j0 = static_cast<int>(fl) - 1;
 
-    std::fill(scratch, scratch + source_.width, PixelF{0.0f, 0.0f, 0.0f, 0.0f});
+    // Only the source columns the requested range reads.
+    const int* idx = tap_index_.data();
+    const int src_begin = idx[x_begin * 4];
+    const int src_end = idx[(x_end - 1) * 4 + 3] + 1;
+
+    std::fill(scratch + src_begin, scratch + src_end, PixelF{0.0f, 0.0f, 0.0f, 0.0f});
     for (int t = 0; t < 4; ++t) {
-        const int j = j0 + t;
-        if (j < 0 || j >= source_.height) continue;
+        const int j = BorderIndex(j0 + t, source_.height, border_);
+        if (j < 0) continue;
         const PixelF* row = source_.Row(j);
-        for (int i = 0; i < source_.width; ++i) Madd(scratch[i], row[i], w[t]);
+        for (int i = src_begin; i < src_end; ++i) Madd(scratch[i], row[i], w[t]);
     }
 
-    const int* idx = tap_index_.data();
     const float* wt = tap_weight_.data();
-    for (int x = 0; x < target_width_; ++x, idx += 4, wt += 4) {
+    for (int x = x_begin; x < x_end; ++x) {
+        const int* ix = idx + x * 4;
+        const float* wx = wt + x * 4;
         PixelF acc{0.0f, 0.0f, 0.0f, 0.0f};
-        Madd(acc, scratch[idx[0]], wt[0]);
-        Madd(acc, scratch[idx[1]], wt[1]);
-        Madd(acc, scratch[idx[2]], wt[2]);
-        Madd(acc, scratch[idx[3]], wt[3]);
+        Madd(acc, scratch[ix[0]], wx[0]);
+        Madd(acc, scratch[ix[1]], wx[1]);
+        Madd(acc, scratch[ix[2]], wx[2]);
+        Madd(acc, scratch[ix[3]], wx[3]);
         out[x] = acc;
     }
 }
 
-PixelF SampleLevel(const ImageF& level, int k, float x0, float y0) {
+PixelF SampleLevel(const ImageF& level, int k, float x0, float y0, BorderMode border) {
     const float inv = std::ldexp(1.0f, -k);
     const float u = (x0 + 0.5f) * inv - 0.5f;
     const float v = (y0 + 0.5f) * inv - 0.5f;
@@ -176,8 +184,8 @@ PixelF SampleLevel(const ImageF& level, int k, float x0, float y0) {
     PixelF acc{0.0f, 0.0f, 0.0f, 0.0f};
     const bool interior = i0 >= 0 && j0 >= 0 && i0 + 3 < level.width && j0 + 3 < level.height;
     for (int t = 0; t < 4; ++t) {
-        const int j = j0 + t;
-        if (!interior && (j < 0 || j >= level.height)) continue;
+        const int j = interior ? j0 + t : BorderIndex(j0 + t, level.height, border);
+        if (j < 0) continue;
         const PixelF* row = level.Row(j);
         PixelF line{0.0f, 0.0f, 0.0f, 0.0f};
         if (interior) {
@@ -187,8 +195,8 @@ PixelF SampleLevel(const ImageF& level, int k, float x0, float y0) {
             Madd(line, row[i0 + 3], wx[3]);
         } else {
             for (int s = 0; s < 4; ++s) {
-                const int i = i0 + s;
-                if (i >= 0 && i < level.width) Madd(line, row[i], wx[s]);
+                const int i = BorderIndex(i0 + s, level.width, border);
+                if (i >= 0) Madd(line, row[i], wx[s]);
             }
         }
         Madd(acc, line, wy[t]);
@@ -197,7 +205,7 @@ PixelF SampleLevel(const ImageF& level, int k, float x0, float y0) {
 }
 
 bool CollapsePyramid(Allocator& allocator, TaskRunner& runner, const Pyramid& pyramid, const float* weights,
-                     int first, int last, OwnedImageF* out) {
+                     int first, int last, OwnedImageF* out, BorderMode border) {
     if (first < 1 || last > pyramid.Count() || first > last) return false;
 
     OwnedImageF acc;
@@ -223,7 +231,7 @@ bool CollapsePyramid(Allocator& allocator, TaskRunner& runner, const Pyramid& py
         if (!next.Allocate(allocator, level.width, level.height)) return false;
         ImageF& n = next.View();
         const ImageF& coarse = acc.View();
-        const BsplineRowSampler sampler(coarse, 1, level.width);
+        const BsplineRowSampler sampler(coarse, 1, level.width, border);
         const float w = weights[k];
         ParallelRows(runner, level.height, [&](int begin, int end, int) {
             std::vector<PixelF> scratch(static_cast<std::size_t>(coarse.width));

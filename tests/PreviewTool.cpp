@@ -161,11 +161,20 @@ int main(int argc, char** argv) {
         if (i == 5) ui.repeat = 3, ui.cycles = 2.0f;  // conic, mirrored twice
     });
 
-    // Depth shapes, on the default linear gradient.
-    Sheet(dir + "/sheet_depth.png", 2, 4, 480, 270, [](int i, cosmic::UiValues& ui) {
+    // Depth shapes, on the default linear gradient: dome, sphere, ridge, wave,
+    // then bulge out and pinched in (negative depth).
+    Sheet(dir + "/sheet_depth.png", 3, 6, 320, 180, [](int i, cosmic::UiValues& ui) {
         cosmic::ApplyPreset(&ui, 4);
-        ui.depth_shape = i + 1;
+        ui.depth_shape = i < 5 ? i + 1 : 5;
         ui.depth_pct = i == 3 ? 12.0f : 45.0f;
+        if (i >= 4) {
+            ui.gradient_type = 1;
+            ui.cycles = 4.0f;
+            ui.repeat = 3;
+            ui.depth_pct = i == 4 ? 70.0f : -80.0f;
+            ui.depth_y = ui.center_y;
+            ui.depth_radius_pct = 30.0f;
+        }
     });
 
     // Turbulence and the loop: evolution a quarter turn apart, then the

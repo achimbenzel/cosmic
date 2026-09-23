@@ -2,12 +2,9 @@
 
 #include <cstdint>
 
-namespace cosmic {
+#include "Shared.h"
 
-// Channel order matches After Effects' ARGB pixel layout.
-struct PixelF {
-    float a, r, g, b;
-};
+namespace cosmic {
 
 struct Pixel8 {
     std::uint8_t a, r, g, b;

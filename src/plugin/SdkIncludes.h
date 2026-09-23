@@ -16,6 +16,8 @@
 #include "AE_Effect.h"
 #include "AE_EffectCB.h"
 #include "AE_EffectCBSuites.h"
+#include "AE_EffectGPUSuites.h"
+#include "AE_EffectPixelFormat.h"
 #include "AE_EffectSuites.h"
 #include "AE_Macros.h"
 #include "Param_Utils.h"
