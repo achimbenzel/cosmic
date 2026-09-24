@@ -6,10 +6,11 @@
 
 namespace cosmic {
 
-// Parameter order is part of the saved project format: once shipped, append,
-// never insert or reorder, or projects saved by an earlier build open with
-// their values against the wrong parameters. The numbers are spelled out so a
-// stray insertion is a compile error rather than a corrupted project.
+// Positions in the parameter list, which is what After Effects indexes the
+// params[] array by. Saved projects do not depend on them: After Effects finds
+// a parameter's saved value by its disk id (ParamId in CosmicParams.cpp), so
+// parameters can be placed anywhere as long as their ids never change. The
+// numbers are spelled out so the layout reads at a glance.
 enum ParamIndex {
     kParamInput = 0,
 
@@ -40,62 +41,65 @@ enum ParamIndex {
     kParamDepth = 23,
     kParamDepthCenter = 24,
     kParamDepthRadius = 25,
-    kParamDepthGroupEnd = 26,
+    kParamBulge = 26,  // v1.2
+    kParamRounding = 27,
+    kParamSoftness = 28,
+    kParamLightAngle = 29,
+    kParamContrast = 30,
+    kParamDepthGroupEnd = 31,
 
-    kParamTurbulenceGroupStart = 27,
-    kParamTurbulence = 28,
-    kParamTurbulenceSize = 29,
-    kParamComplexity = 30,
-    kParamEvolution = 31,
-    kParamLoopWithAngle = 32,
-    kParamSeed = 33,
-    kParamTurbulenceGroupEnd = 34,
+    kParamTurbulenceGroupStart = 32,
+    kParamTurbulence = 33,
+    kParamTurbulenceSize = 34,
+    kParamComplexity = 35,
+    kParamEvolution = 36,
+    kParamLoopWithAngle = 37,
+    kParamSeed = 38,
+    kParamTurbulenceGroupEnd = 39,
 
-    kParamFocusGroupStart = 35,
-    kParamFocusPoint = 36,
-    kParamFocusRadius = 37,
-    kParamFocusFalloff = 38,
-    kParamDefocus = 39,
-    kParamFocusGroupEnd = 40,
+    kParamFocusGroupStart = 40,
+    kParamFocusPoint = 41,
+    kParamFocusRadius = 42,
+    kParamFocusFalloff = 43,
+    kParamDefocus = 44,
+    kParamFocusGroupEnd = 45,
 
-    kParamGlowGroupStart = 41,
-    kParamGlowIntensity = 42,
-    kParamGlowRadius = 43,
-    kParamGlowFalloff = 44,
-    kParamGlowThreshold = 45,
-    kParamGlowSoftness = 46,
-    kParamHighlightProtection = 47,
-    kParamGlowGroupEnd = 48,
+    kParamGlowGroupStart = 46,
+    kParamGlowIntensity = 47,
+    kParamGlowRadius = 48,
+    kParamGlowFalloff = 49,
+    kParamGlowThreshold = 50,
+    kParamGlowSoftness = 51,
+    kParamHighlightProtection = 52,
+    kParamGlowGroupEnd = 53,
 
-    kParamDiffusionGroupStart = 49,
-    kParamDiffusion = 50,
-    kParamDiffusionRadius = 51,
-    kParamDiffusionGroupEnd = 52,
+    kParamDiffusionGroupStart = 54,
+    kParamDiffusion = 55,
+    kParamDiffusionRadius = 56,
+    kParamDiffusionGroupEnd = 57,
 
-    kParamGrainGroupStart = 53,
-    kParamGrain = 54,
-    kParamGrainSize = 55,
-    kParamAnimateGrain = 56,
-    kParamGrainGroupEnd = 57,
+    kParamGrainGroupStart = 58,
+    kParamGrain = 59,
+    kParamGrainSize = 60,
+    kParamAnimateGrain = 61,
+    kParamGrainGroupEnd = 62,
 
-    kParamCompositeGroupStart = 58,
-    kParamMatte = 59,
-    kParamBlend = 60,
-    kParamOpacity = 61,
-    kParamExpandBounds = 62,
-    kParamWorkingSpace = 63,
-    kParamCompositeGroupEnd = 64,
+    kParamCompositeGroupStart = 63,
+    kParamMatte = 64,
+    kParamBlend = 65,
+    kParamOpacity = 66,
+    kParamExpandBounds = 67,
+    kParamWorkingSpace = 68,
+    kParamCompositeGroupEnd = 69,
 
-    kParamAboutGroupStart = 65,
-    kParamAboutGroupEnd = 66,
+    kParamPerformanceGroupStart = 70,
+    kParamGpu = 71,
+    kParamPerformanceGroupEnd = 72,
 
-    // Appended in v1.1. Everything above is the v1.0 layout and must stay put:
-    // saved projects find their values by these positions and ids.
-    kParamPerformanceGroupStart = 67,
-    kParamGpu = 68,
-    kParamPerformanceGroupEnd = 69,
+    kParamAboutGroupStart = 73,
+    kParamAboutGroupEnd = 74,
 
-    kParamCount = 70
+    kParamCount = 75
 };
 
 PF_Err SetupParams(PF_InData* in_data, PF_OutData* out_data);

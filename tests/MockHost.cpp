@@ -55,25 +55,94 @@ void Check(bool condition, const std::string& what) {
     }
 }
 
-// Indices must match ParamIndex in CosmicParams.h.
+// Parameters are found by their disk ids, which is how After Effects matches
+// a saved project's values to them; these must match ParamId in
+// CosmicParams.cpp.
 enum {
-    kIndexPalette = 2,
-    kIndexColor1 = 3,
-    kIndexColor5 = 7,
-    kIndexType = 12,
-    kIndexFit = 13,
-    kIndexDepthShape = 22,
-    kIndexLoopWithAngle = 32,
-    kIndexDefocus = 39,
-    kIndexGlowIntensity = 42,
-    kIndexGlowRadius = 43,
-    kIndexGrain = 54,
-    kIndexAnimateGrain = 56,
-    kIndexMatte = 59,
-    kIndexExpandBounds = 62,
-    kIndexGpu = 68,
-    kParamCountV10 = 67,  // the layout v1.0 shipped with; v1.1 only appends
-    kParamCount = 70
+    kIdPalette = 2,
+    kIdColor1 = 3,
+    kIdColor5 = 7,
+    kIdType = 12,
+    kIdFit = 13,
+    kIdDepthGroup = 21,
+    kIdDepthShape = 22,
+    kIdDepthGroupEnd = 26,
+    kIdTurbulence = 28,
+    kIdLoopWithAngle = 32,
+    kIdDefocus = 39,
+    kIdGlowIntensity = 42,
+    kIdGlowRadius = 43,
+    kIdGrain = 54,
+    kIdAnimateGrain = 56,
+    kIdMatte = 59,
+    kIdExpandBounds = 62,
+    kIdGpu = 68,
+    kIdBulge = 70,
+    kIdRounding = 71,
+    kIdSoftness = 72,
+    kIdLightAngle = 73,
+    kIdContrast = 74,
+    kParamCount = 75  // the input layer and 74 parameters
+};
+
+// The v1.2 panel: the disk id at each position.
+const int kLayout[kParamCount - 1] = {
+    1,  2,  3,  4,  5,  6,  7,  8,  9,  10,               // Palette
+    11, 12, 13, 14, 15, 16, 17, 18, 19, 20,               // Gradient
+    21, 22, 23, 24, 25, 70, 71, 72, 73, 74, 26,           // Depth, with Bulge and its controls
+    27, 28, 29, 30, 31, 32, 33, 34,                       // Turbulence
+    35, 36, 37, 38, 39, 40,                               // Focus
+    41, 42, 43, 44, 45, 46, 47, 48,                       // Glow
+    49, 50, 51, 52,                                       // Optical Diffusion
+    53, 54, 55, 56, 57,                                   // Grain
+    58, 59, 60, 61, 62, 63, 64,                           // Composite
+    67, 68, 69,                                           // Performance
+    65, 66,                                               // version
+};
+
+// Every parameter v1.1 saved, by id: a project saved with v1.0 or v1.1 finds
+// its values under these ids, so each must still be the same control.
+struct SavedParam {
+    int id;
+    PF_ParamType type;
+    const char* name;  // nullptr: not checked (group ends, the version header)
+};
+const SavedParam kV11Params[] = {
+    {1, PF_Param_GROUP_START, "Palette"},     {2, PF_Param_POPUP, "Palette"},
+    {3, PF_Param_COLOR, "Color 1"},           {4, PF_Param_COLOR, "Color 2"},
+    {5, PF_Param_COLOR, "Color 3"},           {6, PF_Param_COLOR, "Color 4"},
+    {7, PF_Param_COLOR, "Color 5"},           {8, PF_Param_POPUP, "Color Blend"},
+    {9, PF_Param_CHECKBOX, "Reverse Palette"}, {10, PF_Param_GROUP_END, nullptr},
+    {11, PF_Param_GROUP_START, "Gradient"},   {12, PF_Param_POPUP, "Type"},
+    {13, PF_Param_POPUP, "Fit"},              {14, PF_Param_POINT, "Center"},
+    {15, PF_Param_ANGLE, "Angle"},            {16, PF_Param_FLOAT_SLIDER, "Size"},
+    {17, PF_Param_FLOAT_SLIDER, "Cycles"},    {18, PF_Param_FLOAT_SLIDER, "Offset"},
+    {19, PF_Param_POPUP, "Repeat"},           {20, PF_Param_GROUP_END, nullptr},
+    {21, PF_Param_GROUP_START, "Depth"},      {22, PF_Param_POPUP, "Depth Shape"},
+    {23, PF_Param_FLOAT_SLIDER, "Depth"},     {24, PF_Param_POINT, "Depth Center"},
+    {25, PF_Param_FLOAT_SLIDER, "Depth Radius"}, {26, PF_Param_GROUP_END, nullptr},
+    {27, PF_Param_GROUP_START, "Turbulence"}, {28, PF_Param_FLOAT_SLIDER, "Turbulence"},
+    {29, PF_Param_FLOAT_SLIDER, "Turbulence Size"}, {30, PF_Param_FLOAT_SLIDER, "Complexity"},
+    {31, PF_Param_ANGLE, "Evolution"},        {32, PF_Param_CHECKBOX, "Loop With Angle"},
+    {33, PF_Param_SLIDER, "Random Seed"},     {34, PF_Param_GROUP_END, nullptr},
+    {35, PF_Param_GROUP_START, "Focus"},      {36, PF_Param_POINT, "Focus Point"},
+    {37, PF_Param_FLOAT_SLIDER, "Focus Radius"}, {38, PF_Param_FLOAT_SLIDER, "Focus Falloff"},
+    {39, PF_Param_FLOAT_SLIDER, "Defocus"},   {40, PF_Param_GROUP_END, nullptr},
+    {41, PF_Param_GROUP_START, "Glow"},       {42, PF_Param_FLOAT_SLIDER, "Glow Intensity"},
+    {43, PF_Param_FLOAT_SLIDER, "Glow Radius"}, {44, PF_Param_FLOAT_SLIDER, "Glow Falloff"},
+    {45, PF_Param_FLOAT_SLIDER, "Glow Threshold"}, {46, PF_Param_FLOAT_SLIDER, "Threshold Softness"},
+    {47, PF_Param_FLOAT_SLIDER, "Highlight Protection"}, {48, PF_Param_GROUP_END, nullptr},
+    {49, PF_Param_GROUP_START, "Optical Diffusion"}, {50, PF_Param_FLOAT_SLIDER, "Diffusion"},
+    {51, PF_Param_FLOAT_SLIDER, "Diffusion Radius"}, {52, PF_Param_GROUP_END, nullptr},
+    {53, PF_Param_GROUP_START, "Grain"},      {54, PF_Param_FLOAT_SLIDER, "Grain Amount"},
+    {55, PF_Param_FLOAT_SLIDER, "Grain Size"}, {56, PF_Param_CHECKBOX, "Animate Grain"},
+    {57, PF_Param_GROUP_END, nullptr},        {58, PF_Param_GROUP_START, "Composite"},
+    {59, PF_Param_POPUP, "Matte"},            {60, PF_Param_POPUP, "Blend Mode"},
+    {61, PF_Param_FLOAT_SLIDER, "Opacity"},   {62, PF_Param_CHECKBOX, "Expand Bounds"},
+    {63, PF_Param_POPUP, "Working Space"},    {64, PF_Param_GROUP_END, nullptr},
+    {65, PF_Param_GROUP_START, nullptr},      {66, PF_Param_GROUP_END, nullptr},
+    {67, PF_Param_GROUP_START, "Performance"}, {68, PF_Param_CHECKBOX, "GPU Acceleration"},
+    {69, PF_Param_GROUP_END, nullptr},
 };
 
 constexpr A_long kExpectedOutFlags = PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_NON_PARAM_VARY;
@@ -408,14 +477,12 @@ MockHost* NewInstance(EffectMainFn effect_main, PF_InData* in_data, PF_OutData* 
     Check(err == PF_Err_NONE, "params setup succeeds");
     Check(out_data->num_params == static_cast<A_long>(host->params.size()) + 1,
           "reported parameter count matches the parameters added");
-    Check(out_data->num_params == kParamCount, "the v1.1 parameter layout");
-    // Saved projects find values by these ids: every id equals its index, the
-    // v1.0 ones unchanged and the new ones appended after them.
+    Check(out_data->num_params == kParamCount, "the v1.2 parameter layout");
     bool ids_ok = host->params.size() + 1 == static_cast<std::size_t>(kParamCount);
-    for (std::size_t i = 0; i < host->params.size(); ++i) {
-        ids_ok = ids_ok && host->params[i].uu.id == static_cast<A_long>(i + 1);
+    for (std::size_t i = 0; ids_ok && i < host->params.size(); ++i) {
+        ids_ok = host->params[i].uu.id == static_cast<A_long>(kLayout[i]);
     }
-    Check(ids_ok, "parameter ids equal their indices, so v1.0 projects map onto v1.1");
+    Check(ids_ok, "every position holds the disk id the layout says");
 
     // After Effects turns a point's percentage default into layer pixels
     // when the effect is applied.
@@ -429,6 +496,23 @@ MockHost* NewInstance(EffectMainFn effect_main, PF_InData* in_data, PF_OutData* 
 }
 
 PF_ParamDef& Param(MockHost* host, int index) { return host->params[static_cast<std::size_t>(index - 1)]; }
+
+// The position of the parameter with this disk id, or -1.
+int IndexOf(const MockHost* host, int id) {
+    for (std::size_t i = 0; i < host->params.size(); ++i) {
+        if (host->params[i].uu.id == id) return static_cast<int>(i) + 1;
+    }
+    return -1;
+}
+
+PF_ParamDef& ById(MockHost* host, int id) {
+    const int index = IndexOf(host, id);
+    if (index < 0) {
+        std::printf("FAIL: no parameter with id %d\n", id);
+        std::exit(1);
+    }
+    return Param(host, index);
+}
 
 struct RenderOptions {
     std::string label;
@@ -444,6 +528,7 @@ struct RenderOptions {
     bool animate_grain = false;
     float turbulence = -1.0f;  // percent; negative keeps the default
     int depth_shape = 0;       // 0 keeps the default
+    float bulge = 0.0f;        // percent
 };
 
 void ApplyOptions(MockHost* host, const RenderOptions& options);
@@ -545,14 +630,15 @@ bool RunRender(EffectMainFn effect_main, const RenderOptions& options, const std
 }
 
 void ApplyOptions(MockHost* host, const RenderOptions& options) {
-    Param(host, kIndexExpandBounds).u.bd.value = options.expand_bounds ? TRUE : FALSE;
-    Param(host, kIndexMatte).u.pd.value = options.matte;
-    Param(host, kIndexType).u.pd.value = options.type;
-    Param(host, kIndexDefocus).u.fs_d.value = options.defocus;
-    Param(host, kIndexGlowRadius).u.fs_d.value = options.glow_radius;
-    Param(host, kIndexAnimateGrain).u.bd.value = options.animate_grain ? TRUE : FALSE;
-    if (options.turbulence >= 0.0f) Param(host, 28).u.fs_d.value = options.turbulence;
-    if (options.depth_shape > 0) Param(host, kIndexDepthShape).u.pd.value = options.depth_shape;
+    ById(host, kIdExpandBounds).u.bd.value = options.expand_bounds ? TRUE : FALSE;
+    ById(host, kIdMatte).u.pd.value = options.matte;
+    ById(host, kIdType).u.pd.value = options.type;
+    ById(host, kIdDefocus).u.fs_d.value = options.defocus;
+    ById(host, kIdGlowRadius).u.fs_d.value = options.glow_radius;
+    ById(host, kIdAnimateGrain).u.bd.value = options.animate_grain ? TRUE : FALSE;
+    if (options.turbulence >= 0.0f) ById(host, kIdTurbulence).u.fs_d.value = options.turbulence;
+    if (options.depth_shape > 0) ById(host, kIdDepthShape).u.pd.value = options.depth_shape;
+    ById(host, kIdBulge).u.fs_d.value = options.bulge;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +663,7 @@ bool RunGpuRender(EffectMainFn effect_main, const RenderOptions& options, bool g
     in_data.downsample_y.den = options.downsample;
     in_data.current_time = 12;
     ApplyOptions(host, options);
-    Param(host, kIndexGpu).u.bd.value = gpu_checkbox ? TRUE : FALSE;
+    ById(host, kIdGpu).u.bd.value = gpu_checkbox ? TRUE : FALSE;
     const std::string label = "gpu " + options.label;
 
     // Device setup: the kernels load into the (fake) CUDA context.
@@ -718,7 +804,13 @@ void TestGpu(EffectMainFn effect_main) {
         RenderOptions o{"defocus_turbulence", 32};
         o.defocus = 14.0f;
         o.turbulence = 12.0f;
-        o.depth_shape = 5;  // Bulge
+        o.depth_shape = 5;  // Lens
+        cases.push_back(o);
+    }
+    {
+        RenderOptions o{"bulge", 32};
+        o.bulge = 100.0f;
+        o.turbulence = 8.0f;
         cases.push_back(o);
     }
     {
@@ -795,29 +887,53 @@ void TestGpu(EffectMainFn effect_main) {
     }
 }
 
-void TestV10Project(EffectMainFn effect_main) {
-    std::printf("-- a project saved with v1.0\n");
-    // After Effects restores saved values by parameter id; the ids v1.0 had
-    // are unchanged, so its values land on the same controls. Values only
-    // v1.0 could have produced must still render.
+void TestOldProjects(EffectMainFn effect_main) {
+    std::printf("-- projects saved with v1.0 and v1.1\n");
+    // After Effects restores saved values by disk id, whatever position a
+    // parameter has now. Every id v1.1 saved must still be the same control.
     PF_InData in_data;
     PF_OutData out_data;
     PF_UtilCallbacks utils;
     MockHost* host = NewInstance(effect_main, &in_data, &out_data, &utils, 160, 90);
+    for (const SavedParam& saved : kV11Params) {
+        const int index = IndexOf(host, saved.id);
+        if (index < 0) {
+            Check(false, "id " + std::to_string(saved.id) + " is still there");
+            continue;
+        }
+        const PF_ParamDef& def = Param(host, index);
+        Check(def.param_type == saved.type, "id " + std::to_string(saved.id) + " keeps its type");
+        if (saved.name != nullptr) {
+            Check(std::strcmp(def.PF_DEF_NAME, saved.name) == 0,
+                  "id " + std::to_string(saved.id) + " is still " + saved.name + " (" + def.PF_DEF_NAME + ")");
+        }
+    }
     std::string depth_names;
     for (const std::string& names : host->popup_strings) {
         if (names.rfind("Dome|", 0) == 0) depth_names = names;
     }
     Check(depth_names.rfind("Dome|Sphere|Ridge|Wave|", 0) == 0,
           "Depth Shape keeps v1.0's four entries in place (" + depth_names + ")");
-    Check(Param(host, kIndexDepthShape).u.pd.num_choices == 5, "and appends Bulge");
-    Check(Param(host, kIndexLoopWithAngle).u.bd.value == FALSE, "new instances do not loop the noise with the angle");
-    Check(Param(host, kIndexGpu).u.bd.value == TRUE, "GPU Acceleration is on for new and old projects alike");
+    Check(ById(host, kIdDepthShape).u.pd.num_choices == 5, "and v1.1's fifth, the lens");
+
+    // The new controls sit in the Depth group and start where v1.1 left off.
+    const int depth_start = IndexOf(host, kIdDepthGroup);
+    const int depth_end = IndexOf(host, kIdDepthGroupEnd);
+    bool inside = true;
+    for (int id : {kIdBulge, kIdRounding, kIdSoftness, kIdLightAngle, kIdContrast}) {
+        const int index = IndexOf(host, id);
+        inside = inside && index > depth_start && index < depth_end;
+    }
+    Check(inside, "Bulge and its controls are in the Depth group");
+    Check(ById(host, kIdBulge).u.fs_d.value == 0.0 && std::strcmp(ById(host, kIdBulge).PF_DEF_NAME, "Bulge") == 0,
+          "Bulge starts at 0%, so an old project renders flat as before");
+    Check(ById(host, kIdLoopWithAngle).u.bd.value == FALSE, "new instances do not loop the noise with the angle");
+    Check(ById(host, kIdGpu).u.bd.value == TRUE, "GPU Acceleration is on for new and old projects alike");
     g_host = nullptr;
     delete host;
 
-    RenderOptions o{"v1.0 values", 8, 160, 90};
-    o.depth_shape = 4;  // Wave, a v1.0 value
+    RenderOptions o{"old values", 8, 160, 90};
+    o.depth_shape = 5;  // the lens, a v1.1 value
     o.turbulence = 10.0f;
     RunRender(effect_main, o, "");
 }
@@ -831,9 +947,15 @@ void TestPaletteSupervision(EffectMainFn effect_main) {
 
     const std::string names = host->popup_strings.empty() ? "" : host->popup_strings[0];
     Check(names.find("Deep Space|") == 0, "the palette popup lists the presets");
-    Check(Param(host, kIndexPalette).u.pd.num_choices == cosmic::PresetCount() + 1,
+    // Positions are resolved first: handling USER_CHANGED_PARAM writes change
+    // flags into the union that holds the ids.
+    const int palette_index = IndexOf(host, kIdPalette);
+    const int color1_index = IndexOf(host, kIdColor1);
+    const int animate_grain_index = IndexOf(host, kIdAnimateGrain);
+    const int grain_index = IndexOf(host, kIdGrain);
+    Check(ById(host, kIdPalette).u.pd.num_choices == cosmic::PresetCount() + 1,
           "the palette popup has every preset plus Custom");
-    Check((Param(host, kIndexPalette).flags & PF_ParamFlag_SUPERVISE) != 0, "the palette popup is supervised");
+    Check((ById(host, kIdPalette).flags & PF_ParamFlag_SUPERVISE) != 0, "the palette popup is supervised");
 
     std::vector<PF_ParamDef*> params(kParamCount, nullptr);
     PF_ParamDef input = {};
@@ -842,25 +964,25 @@ void TestPaletteSupervision(EffectMainFn effect_main) {
 
     // Pick Sunset: the colours follow.
     const int sunset = 4;
-    Param(host, kIndexPalette).u.pd.value = sunset;
-    PF_UserChangedParamExtra extra = {kIndexPalette};
+    Param(host, palette_index).u.pd.value = sunset;
+    PF_UserChangedParamExtra extra = {palette_index};
     PF_Err err = effect_main(PF_Cmd_USER_CHANGED_PARAM, &in_data, &out_data, params.data(), nullptr, &extra);
     Check(err == PF_Err_NONE, "user changed palette succeeds");
     const cosmic::PalettePreset& preset = cosmic::Preset(sunset - 1);
     bool colours_ok = true;
     for (int k = 0; k < cosmic::kStopCount; ++k) {
-        const PF_ParamDef& c = Param(host, kIndexColor1 + k);
+        const PF_ParamDef& c = Param(host, color1_index + k);
         colours_ok = colours_ok && c.u.cd.value.red == preset.srgb[k][0] && c.u.cd.value.green == preset.srgb[k][1] &&
                      c.u.cd.value.blue == preset.srgb[k][2] && (c.uu.change_flags & PF_ChangeFlag_CHANGED_VALUE);
     }
     Check(colours_ok, "picking a palette fills the colour controls");
 
     // Edit a colour: the popup switches to Custom.
-    Param(host, kIndexColor1 + 2).u.cd.value.red = 1;
-    extra.param_index = kIndexColor1 + 2;
+    Param(host, color1_index + 2).u.cd.value.red = 1;
+    extra.param_index = color1_index + 2;
     err = effect_main(PF_Cmd_USER_CHANGED_PARAM, &in_data, &out_data, params.data(), nullptr, &extra);
     Check(err == PF_Err_NONE, "user changed colour succeeds");
-    Check(Param(host, kIndexPalette).u.pd.value == cosmic::PresetCount() + 1, "editing a colour selects Custom");
+    Check(Param(host, palette_index).u.pd.value == cosmic::PresetCount() + 1, "editing a colour selects Custom");
 
     // Dynamic flags: time-varying only when the grain animates.
     out_data.out_flags = kExpectedOutFlags;
@@ -868,10 +990,10 @@ void TestPaletteSupervision(EffectMainFn effect_main) {
     Check(err == PF_Err_NONE, "query dynamic flags succeeds");
     Check((out_data.out_flags & PF_OutFlag_NON_PARAM_VARY) == 0, "still grain lets frames be cached");
     Check((out_data.out_flags & PF_OutFlag_DEEP_COLOR_AWARE) != 0, "other flags are left alone");
-    Param(host, kIndexAnimateGrain).u.bd.value = TRUE;
+    Param(host, animate_grain_index).u.bd.value = TRUE;
     err = effect_main(PF_Cmd_QUERY_DYNAMIC_FLAGS, &in_data, &out_data, nullptr, nullptr, nullptr);
     Check((out_data.out_flags & PF_OutFlag_NON_PARAM_VARY) != 0, "animated grain varies with time");
-    Param(host, kIndexGrain).u.fs_d.value = 0.0;
+    Param(host, grain_index).u.fs_d.value = 0.0;
     err = effect_main(PF_Cmd_QUERY_DYNAMIC_FLAGS, &in_data, &out_data, nullptr, nullptr, nullptr);
     Check((out_data.out_flags & PF_OutFlag_NON_PARAM_VARY) == 0, "no grain, nothing to animate");
 
@@ -925,7 +1047,7 @@ int main(int argc, char** argv) {
     if (effect_main == nullptr) return 1;
 
     TestPaletteSupervision(effect_main);
-    TestV10Project(effect_main);
+    TestOldProjects(effect_main);
 
     std::vector<RenderOptions> cases;
     cases.push_back({"8bpc", 8});
@@ -951,6 +1073,12 @@ int main(int argc, char** argv) {
         RenderOptions o{"defocus", 8};
         o.defocus = 12.0f;
         o.type = 3;
+        cases.push_back(o);
+    }
+    {
+        RenderOptions o{"bulge", 8};
+        o.bulge = 100.0f;
+        o.turbulence = 10.0f;
         cases.push_back(o);
     }
     {

@@ -56,6 +56,14 @@ struct CosmicSettings {
     float depth_y = 0.0f;
     float depth_radius = 0.4f;  // relative, to the box's longer side
 
+    // Bulge: a relief raised from the layer's own shape and looked through
+    // like glass, bending the gradient around the shape's edges.
+    float bulge = 0.0f;            // 0 is a flat gradient
+    float bulge_softness = 1.0f;   // how far in the relief rises: 1 reaches the middle of a typical stroke
+    float rounding = 1.0f;         // 0 a soft cushion, 1 a round glass rim
+    float light_angle = -0.785398163f;  // where the light comes from, After Effects angle
+    float contrast = 0.5f;         // lit walls against shaded ones
+
     // Turbulence: a looping fractal noise that displaces the field.
     float turbulence = 0.0f;        // relative, to the box's shorter side
     float turbulence_size = 0.4f;   // relative, to the box's shorter side

@@ -1,12 +1,16 @@
 // Renders reference scenes through the gradient core and writes PNGs, so the
 // look can be judged without After Effects.
 //
-// Usage: cosmic_preview <output directory>
+// Usage: cosmic_preview <output directory> [layer.pgm]
+//
+// With a layer (an 8-bit binary PGM, used as the alpha of a white layer), only
+// the Bulge scenes are rendered, on that layer.
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -70,6 +74,29 @@ TestImage MakeTextLayer(int width, int height, PixelDepth depth) {
         }
     }
     return image;
+}
+
+// An 8-bit binary PGM as the alpha of a white layer.
+bool LoadPgm(const std::string& path, TestImage* out) {
+    std::ifstream in(path, std::ios::binary);
+    std::string magic;
+    int width = 0;
+    int height = 0;
+    int max_value = 0;
+    in >> magic >> width >> height >> max_value;
+    in.get();
+    if (!in || magic != "P5" || width <= 0 || height <= 0 || max_value != 255) return false;
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(width) * height);
+    in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!in) return false;
+    out->Resize(width, height, PixelDepth::kBits8);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float a = bytes[static_cast<std::size_t>(y) * width + x] / 255.0f;
+            out->SetPixel(x, y, PixelF{a, a, a, a});
+        }
+    }
+    return true;
 }
 
 struct Rendered {
@@ -142,10 +169,83 @@ void Sheet(const std::string& path, int columns, int count, int tile_w, int tile
     std::printf("wrote %s\n", path.c_str());
 }
 
+struct Scene {
+    const char* name;
+    void (*tweak)(cosmic::UiValues&);
+};
+
+// Bulge: the glass relief raised from the layer's shape, and what shapes it.
+const Scene kBulgeScenes[] = {
+    {"bulge_off", [](cosmic::UiValues&) {}},
+    {"bulge_100", [](cosmic::UiValues& ui) { ui.bulge_pct = 100.0f; }},
+    {"bulge_50", [](cosmic::UiValues& ui) { ui.bulge_pct = 50.0f; }},
+    {"bulge_200", [](cosmic::UiValues& ui) { ui.bulge_pct = 200.0f; }},
+    {"bulge_cushion",
+     [](cosmic::UiValues& ui) {
+         ui.bulge_pct = 100.0f;
+         ui.rounding_pct = 0.0f;
+     }},
+    {"bulge_narrow",
+     [](cosmic::UiValues& ui) {
+         ui.bulge_pct = 100.0f;
+         ui.softness_pct = 40.0f;
+     }},
+    {"bulge_wide",
+     [](cosmic::UiValues& ui) {
+         ui.bulge_pct = 100.0f;
+         ui.softness_pct = 250.0f;
+     }},
+    {"bulge_no_light",
+     [](cosmic::UiValues& ui) {
+         ui.bulge_pct = 100.0f;
+         ui.contrast_pct = 0.0f;
+     }},
+    {"bulge_sunset_radial",
+     [](cosmic::UiValues& ui) {
+         cosmic::ApplyPreset(&ui, 4);
+         ui.gradient_type = 2;
+         ui.size_pct = 120.0f;
+         ui.bulge_pct = 100.0f;
+     }},
+    {"bulge_nebula_turbulent",
+     [](cosmic::UiValues& ui) {
+         cosmic::ApplyPreset(&ui, 2);
+         ui.bulge_pct = 100.0f;
+         ui.turbulence_pct = 12.0f;
+     }},
+};
+
+void RenderScenes(const std::string& dir, const TestImage& layer, const Scene* scenes, int count) {
+    const int w = layer.View().width;
+    const int h = layer.View().height;
+    for (int i = 0; i < count; ++i) {
+        cosmic::UiValues ui;
+        cosmic::PlaceDefaultPoints(&ui, static_cast<float>(w), static_cast<float>(h));
+        const float s = h / 1080.0f;
+        ui.glow_radius_px *= s;
+        ui.diffusion_radius_px *= s;
+        scenes[i].tweak(ui);
+        const Rendered r = Render(ui, &layer, w, h, PixelDepth::kBits8);
+        const std::string path = dir + "/" + scenes[i].name + ".png";
+        cosmic_test::WritePng(path, r.image);
+        std::printf("wrote %s (%dx%d, %.1f ms)\n", path.c_str(), r.image.View().width, r.image.View().height,
+                    r.milliseconds);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : ".";
+    if (argc > 2) {
+        TestImage layer;
+        if (!LoadPgm(argv[2], &layer)) {
+            std::printf("could not read %s (want an 8-bit binary PGM)\n", argv[2]);
+            return 1;
+        }
+        RenderScenes(dir, layer, kBulgeScenes, static_cast<int>(sizeof(kBulgeScenes) / sizeof(kBulgeScenes[0])));
+        return 0;
+    }
     const int w = 960;
     const int h = 540;
 
@@ -162,7 +262,7 @@ int main(int argc, char** argv) {
     });
 
     // Depth shapes, on the default linear gradient: dome, sphere, ridge, wave,
-    // then bulge out and pinched in (negative depth).
+    // then the lens magnifying and pinching (negative depth).
     Sheet(dir + "/sheet_depth.png", 3, 6, 320, 180, [](int i, cosmic::UiValues& ui) {
         cosmic::ApplyPreset(&ui, 4);
         ui.depth_shape = i < 5 ? i + 1 : 5;
@@ -257,6 +357,8 @@ int main(int argc, char** argv) {
         std::printf("wrote %s (%dx%d, %.1f ms)\n", path.c_str(), r.image.View().width, r.image.View().height,
                     r.milliseconds);
     }
+
+    RenderScenes(dir, text, kBulgeScenes, static_cast<int>(sizeof(kBulgeScenes) / sizeof(kBulgeScenes[0])));
 
     // Timing at 1080p and 4K, full frame, defaults.
     for (int scale = 1; scale <= 2; ++scale) {

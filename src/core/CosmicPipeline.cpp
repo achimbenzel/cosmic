@@ -14,58 +14,57 @@ namespace cosmic {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Turbulence: a coarse grid of displacement vectors, reconstructed with the
-// cubic B-spline. The noise is smooth at the scale it is asked for, so
-// evaluating it at every pixel would buy nothing but time.
+// Turbulence: displacement vectors on a lattice fixed in noise space,
+// reconstructed with the cubic B-spline. The noise is smooth at the scale it
+// is asked for, so evaluating it at every pixel would buy nothing but time.
 // ---------------------------------------------------------------------------
 
 class WarpGrid {
 public:
     bool Active() const { return active_; }
+    const WarpLattice& Lattice() const { return lattice_; }
 
-    void Build(const WarpPlan& plan, const CosmicRender& r, int canvas_left, int canvas_top, TaskRunner& runner) {
+    void Build(const WarpPlan& plan, TaskRunner& runner) {
         active_ = plan.active;
         if (!active_) return;
-        step_ = plan.step;
-        nx_ = plan.nx;
-        ny_ = plan.ny;
-        data_.assign(static_cast<std::size_t>(nx_) * static_cast<std::size_t>(ny_) * 2, 0.0f);
-        ParallelRows(runner, ny_, [&](int begin, int end, int) {
+        lattice_ = plan.lattice;
+        const int nx = lattice_.nx;
+        data_.assign(static_cast<std::size_t>(nx) * static_cast<std::size_t>(lattice_.ny) * 2, 0.0f);
+        ParallelRows(runner, lattice_.ny, [&](int begin, int end, int) {
             for (int j = begin; j < end; ++j) {
-                for (int i = 0; i < nx_; ++i) {
-                    WarpNode(i, j, step_, canvas_left, canvas_top, r.to_full_x, r.to_full_y, plan.inv_size,
-                             plan.amount, plan.evolution, plan.fbm, plan.fbm2,
-                             &data_[(static_cast<std::size_t>(j) * nx_ + i) * 2]);
+                for (int i = 0; i < nx; ++i) {
+                    WarpNode(i, j, lattice_, plan.amount, plan.evolution, plan.fbm, plan.fbm2,
+                             &data_[(static_cast<std::size_t>(j) * nx + i) * 2]);
                 }
             }
         });
     }
 
-    // Blends the four grid rows around canvas row y into `row` (nx * 2 floats).
-    void Row(int y, float* row) const {
-        const float s = static_cast<float>(y) / static_cast<float>(step_);
-        const float fl = std::floor(s);
+    // Blends the four grid rows around grid coordinate gy into `row`
+    // (nx * 2 floats).
+    void Row(float gy, float* row) const {
+        const float fl = std::floor(gy);
         float w[4];
-        BsplineWeights(s - fl, w);
-        const int j0 = static_cast<int>(fl) - 1 + 2;
-        std::fill(row, row + nx_ * 2, 0.0f);
+        BsplineWeights(gy - fl, w);
+        const int j0 = static_cast<int>(fl) - 1;
+        const int floats = lattice_.nx * 2;
+        std::fill(row, row + floats, 0.0f);
         for (int t = 0; t < 4; ++t) {
-            const int j = std::clamp(j0 + t, 0, ny_ - 1);
-            const float* in = &data_[static_cast<std::size_t>(j) * nx_ * 2];
-            for (int i = 0; i < nx_ * 2; ++i) row[i] += in[i] * w[t];
+            const int j = std::clamp(j0 + t, 0, lattice_.ny - 1);
+            const float* in = &data_[static_cast<std::size_t>(j) * floats];
+            for (int i = 0; i < floats; ++i) row[i] += in[i] * w[t];
         }
     }
 
-    void At(const float* row, int x, float* wx, float* wy) const {
-        const float s = static_cast<float>(x) / static_cast<float>(step_);
-        const float fl = std::floor(s);
+    void At(const float* row, float gx, float* wx, float* wy) const {
+        const float fl = std::floor(gx);
         float w[4];
-        BsplineWeights(s - fl, w);
-        const int i0 = static_cast<int>(fl) - 1 + 2;
+        BsplineWeights(gx - fl, w);
+        const int i0 = static_cast<int>(fl) - 1;
         float ax = 0.0f;
         float ay = 0.0f;
         for (int t = 0; t < 4; ++t) {
-            const int i = std::min(i0 + t, nx_ - 1);
+            const int i = std::clamp(i0 + t, 0, lattice_.nx - 1);
             ax += row[i * 2] * w[t];
             ay += row[i * 2 + 1] * w[t];
         }
@@ -73,15 +72,86 @@ public:
         *wy = ay;
     }
 
-    int RowFloats() const { return nx_ * 2; }
+    int RowFloats() const { return lattice_.nx * 2; }
 
 private:
     bool active_ = false;
-    int step_ = 1;
-    int nx_ = 0;
-    int ny_ = 0;
+    WarpLattice lattice_;
     std::vector<float> data_;
 };
+
+// One pass of a level of the relief's pyramid over row y: SmoothAt at every
+// pixel, with the pixels whose taps are all inside summed without the border
+// checks, in the same order, so the result is the same to the bit.
+void SmoothRow(const float* src, int w, int h, int y, int step, bool vertical, BorderMode border, float* out) {
+    const float t0 = SmoothTap(0);
+    const float t1 = SmoothTap(1);
+    const float t2 = SmoothTap(2);
+    const int reach = 2 * step;
+    if (vertical) {
+        if (y - reach < 0 || y + reach >= h) {
+            for (int x = 0; x < w; ++x) out[x] = SmoothAt(src, w, h, x, y, step, 1, border);
+            return;
+        }
+        const float* r0 = src + static_cast<std::size_t>(y - reach) * w;
+        const float* r1 = src + static_cast<std::size_t>(y - step) * w;
+        const float* r2 = src + static_cast<std::size_t>(y) * w;
+        const float* r3 = src + static_cast<std::size_t>(y + step) * w;
+        const float* r4 = src + static_cast<std::size_t>(y + reach) * w;
+        for (int x = 0; x < w; ++x) {
+            float acc = 0.0f;
+            acc += r0[x] * t0;
+            acc += r1[x] * t1;
+            acc += r2[x] * t2;
+            acc += r3[x] * t1;
+            acc += r4[x] * t0;
+            out[x] = acc;
+        }
+        return;
+    }
+    const float* row = src + static_cast<std::size_t>(y) * w;
+    const int inner_begin = std::min(reach, w);
+    const int inner_end = std::max(inner_begin, w - reach);
+    for (int x = 0; x < inner_begin; ++x) out[x] = SmoothAt(src, w, h, x, y, step, 0, border);
+    for (int x = inner_begin; x < inner_end; ++x) {
+        float acc = 0.0f;
+        acc += row[x - reach] * t0;
+        acc += row[x - step] * t1;
+        acc += row[x] * t2;
+        acc += row[x + step] * t1;
+        acc += row[x + reach] * t0;
+        out[x] = acc;
+    }
+    for (int x = inner_end; x < w; ++x) out[x] = SmoothAt(src, w, h, x, y, step, 0, border);
+}
+
+// The layer's alpha for MeasureRow.
+struct HostAlpha {
+    const HostImage* image;
+    float At(int x, int y) const {
+        if (x < 0 || y < 0 || x >= image->width || y >= image->height) return 0.0f;
+        return Clampf(ReadHostPixel(*image, image->ConstRow(y), x).a, 0.0f, 1.0f);
+    }
+};
+
+ShapeMeasure MeasureSource(const CosmicRender& render, bool outline, TaskRunner* runner) {
+    const HostImage& source = render.source;
+    if (source.Empty()) return ShapeMeasure();
+    std::vector<RowStats> rows(static_cast<std::size_t>(source.height));
+    const HostAlpha alpha{&source};
+    auto measure = [&](int begin, int end, int) {
+        for (int y = begin; y < end; ++y) {
+            rows[static_cast<std::size_t>(y)] = MeasureRow(alpha, y, source.width, kVisibleAlpha, outline ? 1 : 0,
+                                                           render.to_full_x, render.to_full_y);
+        }
+    };
+    if (runner != nullptr) {
+        ParallelRows(*runner, source.height, measure);
+    } else {
+        measure(0, source.height, 0);
+    }
+    return MeasureShape(rows.data(), source.height);
+}
 
 // ---------------------------------------------------------------------------
 // Pixel helpers
@@ -138,40 +208,9 @@ float GradientCoordinate(const CosmicSettings& settings, const ReferenceBox& box
 }
 
 ReferenceBox FindReferenceBox(const CosmicSettings& settings, const CosmicRender& render) {
-    const HostImage& source = render.source;
-    if (!WantsContentBounds(settings) || source.Empty()) {
-        return BoxFromSourceBounds(settings, 0, -1, 0, -1, 0, 0, 1.0f, 1.0f);
-    }
-    // Anything below half an 8-bit step is treated as empty, so faint
-    // anti-aliasing or a soft shadow does not stretch the box.
-    int x0 = source.width;
-    int x1 = -1;
-    int y0 = source.height;
-    int y1 = -1;
-    for (int y = 0; y < source.height; ++y) {
-        const void* row = source.ConstRow(y);
-        int first = -1;
-        for (int x = 0; x < source.width; ++x) {
-            if (ReadHostPixel(source, row, x).a > kVisibleAlpha) {
-                first = x;
-                break;
-            }
-        }
-        if (first < 0) continue;
-        int last = first;
-        for (int x = source.width - 1; x > first; --x) {
-            if (ReadHostPixel(source, row, x).a > kVisibleAlpha) {
-                last = x;
-                break;
-            }
-        }
-        x0 = std::min(x0, first);
-        x1 = std::max(x1, last);
-        y0 = std::min(y0, y);
-        y1 = y;
-    }
-    return BoxFromSourceBounds(settings, x0, x1, y0, y1, render.source_left, render.source_top, render.to_full_x,
-                               render.to_full_y);
+    if (!WantsContentBounds(settings) || render.source.Empty()) return LayerBox(settings);
+    return BoxFromShape(settings, MeasureSource(render, false, nullptr), render.source_left, render.source_top,
+                        render.to_full_x, render.to_full_y);
 }
 
 float EffectReach(const CosmicSettings& s, float blur_scale) {
@@ -202,7 +241,13 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
 
     GradientLut lut;
     lut.Build(settings.stops, settings.color_blend, settings.reverse);
-    const ReferenceBox box = FindReferenceBox(settings, render);
+    const HostImage& source = render.source;
+    ShapeMeasure shape;
+    if (WantsShapeMeasure(settings) && !source.Empty()) {
+        shape = MeasureSource(render, settings.bulge > 0.0f, &runner);
+    }
+    const ReferenceBox box =
+        BoxFromShape(settings, shape, render.source_left, render.source_top, render.to_full_x, render.to_full_y);
     const Field field = MakeField(settings, box);
 
     // The canvas is the output. Where the matte fills the layer edge to edge,
@@ -214,15 +259,103 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
     const BorderMode border = CanExpand(settings) ? BorderMode::kZero : BorderMode::kClamp;
 
     WarpGrid warp;
-    warp.Build(MakeWarpPlan(settings, box, render.blur_scale, width, height), render, canvas_left, canvas_top, runner);
+    warp.Build(MakeWarpPlan(settings, box, render.to_full_x, render.to_full_y, canvas_left, canvas_top, width, height),
+               runner);
+
+    // --- 0. The Bulge relief: lookup offsets and palette shifts --------------
+    OwnedImageF relief;
+    ReliefGeometry geometry;
+    geometry.canvas_left = canvas_left;
+    geometry.canvas_top = canvas_top;
+    geometry.width = width;
+    geometry.height = height;
+    geometry.source_left = render.source_left;
+    geometry.source_top = render.source_top;
+    geometry.source_width = source.width;
+    geometry.source_height = source.height;
+    geometry.to_full_x = render.to_full_x;
+    geometry.to_full_y = render.to_full_y;
+    geometry.blur_scale = render.blur_scale;
+    const ReliefPlan relief_plan = MakeReliefPlan(settings, box, shape, geometry);
+    if (relief_plan.active && !source.Empty()) {
+        // Level 0 is the shape over the relief's domain; each level is
+        // filtered from the one before into `level`, except level lo, which
+        // goes to `kept` when level lo + 1 is needed as well.
+        const int dw = relief_plan.domain_width;
+        const int dh = relief_plan.domain_height;
+        const int domain_x = canvas_left + relief_plan.domain_left;  // layer pixels
+        const int domain_y = canvas_top + relief_plan.domain_top;
+        const std::size_t count = static_cast<std::size_t>(dw) * static_cast<std::size_t>(dh);
+        OwnedFloats level;
+        OwnedFloats tmp;
+        OwnedFloats kept;
+        if (!level.Allocate(allocator, count) || !tmp.Allocate(allocator, count)) return CosmicResult::kOutOfMemory;
+        if (relief_plan.hi > relief_plan.lo && !kept.Allocate(allocator, count)) return CosmicResult::kOutOfMemory;
+        const int invert = relief_plan.invert;
+        const float outside = ShapeValue(0.0f, invert);
+        {
+            float* shape_data = level.Data();
+            ParallelRows(runner, dh, [&](int begin, int end, int) {
+                for (int y = begin; y < end; ++y) {
+                    float* out = shape_data + static_cast<std::size_t>(y) * dw;
+                    std::fill(out, out + dw, outside);
+                    const int sy = domain_y + y - render.source_top;
+                    if (sy < 0 || sy >= source.height) continue;
+                    const void* row = source.ConstRow(sy);
+                    const int first = std::max(0, render.source_left - domain_x);
+                    const int last = std::min(dw, render.source_left + source.width - domain_x);
+                    for (int x = first; x < last; ++x) {
+                        out[x] = ShapeValue(ReadHostPixel(source, row, domain_x + x - render.source_left).a, invert);
+                    }
+                }
+            });
+        }
+        const float* src = level.Data();
+        for (int k = 1; k <= relief_plan.hi; ++k) {
+            const int step = SmoothLevelStep(k);
+            float* t = tmp.Data();
+            ParallelRows(runner, dh, [&](int begin, int end, int) {
+                for (int y = begin; y < end; ++y) {
+                    SmoothRow(src, dw, dh, y, step, false, border, t + static_cast<std::size_t>(y) * dw);
+                }
+            });
+            float* dst = (k == relief_plan.lo && relief_plan.hi > relief_plan.lo) ? kept.Data() : level.Data();
+            ParallelRows(runner, dh, [&](int begin, int end, int) {
+                for (int y = begin; y < end; ++y) {
+                    SmoothRow(t, dw, dh, y, step, true, border, dst + static_cast<std::size_t>(y) * dw);
+                }
+            });
+            src = dst;
+        }
+        tmp.Release();
+
+        const float* lo = relief_plan.hi > relief_plan.lo ? kept.Data() : level.Data();
+        const float* hi = level.Data();
+        if (!relief.Allocate(allocator, width, height)) return CosmicResult::kOutOfMemory;
+        ImageF& out_image = relief.View();
+        ParallelRows(runner, height, [&](int begin, int end, int) {
+            for (int cy = begin; cy < end; ++cy) {
+                PixelF* out = out_image.Row(cy);
+                for (int cx = 0; cx < width; ++cx) {
+                    float dx = 0.0f;
+                    float dy = 0.0f;
+                    float lift = 0.0f;
+                    ReliefPixel(lo, hi, relief_plan.mix, dw, dh, cx - relief_plan.domain_left,
+                                cy - relief_plan.domain_top, relief_plan.shape, &dx, &dy, &lift);
+                    out[cx] = PixelF{lift, dx, dy, 0.0f};
+                }
+            }
+        });
+    }
 
     // --- 1. The gradient, matted and blended with the layer ----------------
     OwnedImageF base;
     if (!base.Allocate(allocator, width, height)) return CosmicResult::kOutOfMemory;
     {
         ImageF& out_image = base.View();
-        const HostImage& source = render.source;
         const float opacity = std::clamp(settings.opacity, 0.0f, 1.0f);
+        const WarpLattice& lattice = warp.Lattice();
+        const bool has_relief = relief.Valid();
         ParallelRows(runner, height, [&](int begin, int end, int) {
             std::vector<PixelF> src_row(static_cast<std::size_t>(width));
             std::vector<float> warp_row(warp.Active() ? static_cast<std::size_t>(warp.RowFloats()) : 0);
@@ -240,7 +373,12 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
                             transfer.IsIdentity());
                     }
                 }
-                if (warp.Active()) warp.Row(cy, warp_row.data());
+                if (warp.Active()) {
+                    warp.Row(WarpGridCoordinate(cy, canvas_top, render.to_full_y, lattice.anchor_y, lattice.scale,
+                                                lattice.origin_j),
+                             warp_row.data());
+                }
+                const PixelF* relief_row = has_relief ? relief.View().Row(cy) : nullptr;
 
                 const float fy = (static_cast<float>(ly) + 0.5f) * render.to_full_y;
                 PixelF* out = out_image.Row(cy);
@@ -257,11 +395,21 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
                     if (warp.Active()) {
                         float wx = 0.0f;
                         float wy = 0.0f;
-                        warp.At(warp_row.data(), cx, &wx, &wy);
+                        warp.At(warp_row.data(),
+                                WarpGridCoordinate(cx, canvas_left, render.to_full_x, lattice.anchor_x, lattice.scale,
+                                                   lattice.origin_i),
+                                &wx, &wy);
                         x += wx;
                         y += wy;
                     }
-                    Rgb color = lut.Sample(FieldValue(field, x, y));
+                    float lift = 0.0f;
+                    if (relief_row != nullptr) {
+                        const PixelF& rv = relief_row[cx];
+                        x += rv.r;
+                        y += rv.g;
+                        lift = rv.a;
+                    }
+                    Rgb color = lut.Sample(FieldValue(field, x, y, lift));
                     if (settings.blend != BlendMode::kNormal) {
                         const float inv = src.a > kTransparent ? 1.0f / src.a : 0.0f;
                         color = BlendColor(settings.blend, Rgb{src.r * inv, src.g * inv, src.b * inv}, color,
@@ -275,6 +423,8 @@ CosmicResult RenderCosmic(const CosmicSettings& settings, const CosmicRender& re
             }
         });
     }
+
+    relief.Release();
 
     // --- 2. Focus: sharp inside the radius, defocused beyond ----------------
     OwnedImageF focused;

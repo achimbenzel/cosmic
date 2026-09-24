@@ -46,7 +46,9 @@ constexpr float kTwoPi = 6.28318530717958647f;
 
 enum class GradientType { kLinear = 0, kRadial = 1, kConic = 2, kDiamond = 3, kReflected = 4 };
 enum class RepeatMode { kNone = 0, kRepeat = 1, kMirror = 2 };
-enum class DepthShape { kDome = 0, kSphere = 1, kRidge = 2, kWave = 3, kBulge = 4 };
+// kLens was added in v1.1 (as "Bulge"; renamed when Bulge became the relief
+// raised from the layer's shape).
+enum class DepthShape { kDome = 0, kSphere = 1, kRidge = 2, kWave = 3, kLens = 4 };
 enum class MatteMode { kLayerAlpha = 0, kInvertedAlpha = 1, kFullFrame = 2 };
 enum class BlendMode { kNormal = 0, kMultiply = 1, kScreen = 2, kOverlay = 3, kColor = 4 };
 
@@ -368,20 +370,41 @@ COSMIC_HD float LoopingFbm(float x, float y, float phase, const FbmSettings& set
 }
 
 // ---------------------------------------------------------------------------
-// Turbulence grid
+// Turbulence lattice
 // ---------------------------------------------------------------------------
 
-// The displacement at grid node (i, j). Nodes start two steps before the
-// canvas, so the cubic reconstruction has neighbours at the edges.
-COSMIC_HD void WarpNode(int i, int j, int step, int canvas_left, int canvas_top, float to_full_x, float to_full_y,
-                        float inv_size, float amount, float evolution, const FbmSettings& fbm,
-                        const FbmSettings& fbm2, float* out) {
-    const float py = (static_cast<float>(canvas_top + (j - 2) * step) + 0.5f) * to_full_y;
-    const float px = (static_cast<float>(canvas_left + (i - 2) * step) + 0.5f) * to_full_x;
-    const float qx = px * inv_size;
-    const float qy = py * inv_size;
+// The turbulence is evaluated on a lattice of nodes fixed in noise space and
+// reconstructed between them. Noise space is laid out from the reference box:
+// its origin is the box's centre and one unit is the Turbulence Size. So the
+// noise travels and scales with the content it distorts, and nothing about it
+// depends on the canvas around the content or the render resolution: a moving
+// layer carries its turbulence with it instead of sliding through a still
+// pattern.
+struct WarpLattice {
+    int nx = 0;             // nodes in the grid
+    int ny = 0;
+    int origin_i = 0;       // lattice index of grid node (0, 0)
+    int origin_j = 0;
+    float spacing = 1.0f;   // noise units between nodes
+    float anchor_x = 0.0f;  // full-resolution pixel at noise coordinate 0
+    float anchor_y = 0.0f;
+    float scale = 1.0f;     // full-resolution pixels to lattice steps
+};
+
+// The displacement at grid node (i, j), in full-resolution pixels.
+COSMIC_HD void WarpNode(int i, int j, const WarpLattice& lattice, float amount, float evolution,
+                        const FbmSettings& fbm, const FbmSettings& fbm2, float* out) {
+    const float qx = static_cast<float>(lattice.origin_i + i) * lattice.spacing;
+    const float qy = static_cast<float>(lattice.origin_j + j) * lattice.spacing;
     out[0] = amount * LoopingFbm(qx, qy, evolution, fbm);
     out[1] = amount * LoopingFbm(qx + 31.416f, qy - 47.853f, evolution, fbm2);
+}
+
+// Where canvas pixel `c` along one axis falls on the grid, in node steps from
+// node 0.
+COSMIC_HD float WarpGridCoordinate(int c, int canvas_origin, float to_full, float anchor, float scale, int origin) {
+    const float full = (static_cast<float>(canvas_origin + c) + 0.5f) * to_full;
+    return (full - anchor) * scale - static_cast<float>(origin);
 }
 
 // ---------------------------------------------------------------------------
@@ -401,24 +424,22 @@ COSMIC_HD void BsplineWeights(float f, float* w) {
     w[3] = f3 * (1.0f / 6.0f);
 }
 
-// Displacement at canvas pixel (x, y), reconstructed from the 4 x 4 nearest
-// grid nodes with the cubic B-spline: each column vertically, then across, the
-// same order the CPU's row-wise version sums in.
-COSMIC_HD void SampleWarp(const float* grid, int nx, int ny, int step, int x, int y, float* out_x, float* out_y) {
-    const float sy = static_cast<float>(y) / static_cast<float>(step);
-    const float fly = floorf(sy);
+// Displacement at grid coordinate (gx, gy), reconstructed from the 4 x 4
+// nearest nodes with the cubic B-spline: each column vertically, then across,
+// the same order the CPU's row-wise version sums in.
+COSMIC_HD void SampleWarp(const float* grid, int nx, int ny, float gx, float gy, float* out_x, float* out_y) {
+    const float fly = floorf(gy);
     float wy[4];
-    BsplineWeights(sy - fly, wy);
-    const int j0 = static_cast<int>(fly) + 1;
-    const float sx = static_cast<float>(x) / static_cast<float>(step);
-    const float flx = floorf(sx);
+    BsplineWeights(gy - fly, wy);
+    const int j0 = static_cast<int>(fly) - 1;
+    const float flx = floorf(gx);
     float wx[4];
-    BsplineWeights(sx - flx, wx);
-    const int i0 = static_cast<int>(flx) + 1;
+    BsplineWeights(gx - flx, wx);
+    const int i0 = static_cast<int>(flx) - 1;
     float ax = 0.0f;
     float ay = 0.0f;
     for (int s = 0; s < 4; ++s) {
-        const int i = i0 + s < nx - 1 ? i0 + s : nx - 1;
+        const int i = Clampi(i0 + s, 0, nx - 1);
         float cx = 0.0f;
         float cy = 0.0f;
         for (int t = 0; t < 4; ++t) {
@@ -474,11 +495,11 @@ struct Field {
     float inv_depth_radius = 1.0f;
 };
 
-// Bulge: a lens over the depth centre that magnifies the field inside the
-// radius (or pinches it, for negative depth), leaving it untouched at the rim.
-// The strength is limited to keep the mapping one-to-one: past those limits
-// the field would fold over itself.
-COSMIC_HD void BulgePoint(const Field& f, float* x, float* y) {
+// Lens: magnifies the field inside the radius around the depth centre (or
+// pinches it, for negative depth), leaving it untouched at the rim. The
+// strength is limited to keep the mapping one-to-one: past those limits the
+// field would fold over itself.
+COSMIC_HD void LensPoint(const Field& f, float* x, float* y) {
     const float qx = (*x - f.depth_x) * f.inv_depth_radius;
     const float qy = (*y - f.depth_y) * f.inv_depth_radius;
     const float r2 = qx * qx + qy * qy;
@@ -491,9 +512,10 @@ COSMIC_HD void BulgePoint(const Field& f, float* x, float* y) {
 }
 
 // The palette coordinate at a full-resolution position (after any turbulence
-// displacement), with repeat applied.
-COSMIC_HD float FieldValue(const Field& f, float x, float y) {
-    if (f.depth != 0.0f && f.depth_shape == DepthShape::kBulge) BulgePoint(f, &x, &y);
+// and relief displacement), with repeat applied. `lift` is added to the
+// coordinate before cycles and repeat, like the depth field's height.
+COSMIC_HD float FieldValue(const Field& f, float x, float y, float lift = 0.0f) {
+    if (f.depth != 0.0f && f.depth_shape == DepthShape::kLens) LensPoint(f, &x, &y);
 
     const float px = x - f.cx;
     const float py = y - f.cy;
@@ -522,7 +544,7 @@ COSMIC_HD float FieldValue(const Field& f, float x, float y) {
             break;
     }
 
-    if (f.depth != 0.0f && f.depth_shape != DepthShape::kBulge) {
+    if (f.depth != 0.0f && f.depth_shape != DepthShape::kLens) {
         const float qx = (x - f.depth_x) * f.inv_depth_radius;
         const float qy = (y - f.depth_y) * f.inv_depth_radius;
         float h = 0.0f;
@@ -550,6 +572,7 @@ COSMIC_HD float FieldValue(const Field& f, float x, float y) {
         }
         t += f.depth * h;
     }
+    t += lift;
 
     t = t * f.cycles + f.offset;
     switch (f.repeat) {
@@ -565,6 +588,180 @@ COSMIC_HD float FieldValue(const Field& f, float x, float y) {
             if (f.type == GradientType::kConic) return Fract(t);
             return Clampf(t, 0.0f, 1.0f);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The layer's shape: measurements and the Bulge relief
+// ---------------------------------------------------------------------------
+
+// What one row of the layer contributes to the measurements of its shape: the
+// visible extent with the coverage at its ends (for bounds that move smoothly
+// with the content rather than in whole pixels), and the area and outline
+// length (for the relief's scale). Filled by MeasureRow on both renderers.
+struct RowStats {
+    int first;          // first pixel with alpha above the visibility floor, -1 for none
+    int last;
+    float alpha_first;  // the alpha of those two pixels
+    float alpha_last;
+    float alpha_max;    // the row's largest alpha
+    float area;         // sum of alpha, in full-resolution square pixels
+    float outline;      // sum of the alpha gradient's length: the outline's length
+    float unused;
+};
+
+// `alpha.At(x, y)` is the layer's alpha clamped to [0, 1], and 0 outside it.
+// Areas and lengths are in full-resolution pixels.
+template <typename Alpha>
+COSMIC_HD RowStats MeasureRow(const Alpha& alpha, int y, int width, float visible, int measure_outline,
+                              float to_full_x, float to_full_y) {
+    RowStats s;
+    s.first = -1;
+    s.last = -1;
+    s.alpha_first = s.alpha_last = s.alpha_max = s.area = s.outline = s.unused = 0.0f;
+    const float pixel_area = to_full_x * to_full_y;
+    const float gx_scale = 0.5f / to_full_x;
+    const float gy_scale = 0.5f / to_full_y;
+    for (int x = 0; x < width; ++x) {
+        const float a = alpha.At(x, y);
+        if (a > visible) {
+            if (s.first < 0) {
+                s.first = x;
+                s.alpha_first = a;
+            }
+            s.last = x;
+            s.alpha_last = a;
+        }
+        s.alpha_max = Maxf(s.alpha_max, a);
+        if (measure_outline) {
+            const float gx = (alpha.At(x + 1, y) - alpha.At(x - 1, y)) * gx_scale;
+            const float gy = (alpha.At(x, y + 1) - alpha.At(x, y - 1)) * gy_scale;
+            s.area += a * pixel_area;
+            s.outline += sqrtf(gx * gx + gy * gy) * pixel_area;
+        }
+    }
+    return s;
+}
+
+// What the relief is raised from: the layer's alpha, or the space around it
+// under an inverted matte.
+COSMIC_HD float ShapeValue(float alpha, int invert) {
+    const float a = Clampf(alpha, 0.0f, 1.0f);
+    return invert ? 1.0f - a : a;
+}
+
+// The relief's blur is an undecimated ("a trous") pyramid: level k is level
+// k - 1 filtered with the B3-spline (1 4 6 4 1) / 16 spread 2^(k-1) pixels
+// apart, horizontally then vertically. Every level stays on the canvas grid,
+// so the blur of a shape moved by whole pixels is the same blur moved by
+// those pixels - unlike a decimating pyramid, whose result depends on where
+// the shape falls on its coarser grids and would shimmer as the shape moves.
+COSMIC_HD float SmoothTap(int m) {
+    switch (m) {
+        case 0:
+        case 4: return 1.0f / 16.0f;
+        case 1:
+        case 3: return 4.0f / 16.0f;
+        default: return 6.0f / 16.0f;
+    }
+}
+
+// One pass of a level at pixel (x, y): along x, or along y when `vertical`.
+COSMIC_HD float SmoothAt(const float* src, int w, int h, int x, int y, int step, int vertical, BorderMode border) {
+    float acc = 0.0f;
+    for (int m = 0; m < 5; ++m) {
+        const int offset = (m - 2) * step;
+        if (vertical) {
+            const int j = BorderIndex(y + offset, h, border);
+            if (j >= 0) acc += src[j * w + x] * SmoothTap(m);
+        } else {
+            const int i = BorderIndex(x + offset, w, border);
+            if (i >= 0) acc += src[y * w + i] * SmoothTap(m);
+        }
+    }
+    return acc;
+}
+
+// The relief's per-pixel constants, resolved on the host.
+struct ReliefShape {
+    float inv_full_x = 1.0f;  // per render pixel to per full-resolution pixel
+    float inv_full_y = 1.0f;
+    float height = 1.0f;      // the relief's height, full-resolution pixels
+    float rounding = 1.0f;    // 0 a soft cushion, 1 a round glass rim
+    float refraction = 0.0f;  // lookup offset under a vertical wall, full-resolution pixels
+    float shade = 0.0f;       // palette shift of a wall facing the light
+    float rim = 0.0f;         // palette shift of a vertical wall, whichever way it faces
+    float light_x = 0.0f;     // unit vector towards the light, y down
+    float light_y = -1.0f;
+    float glint = 0.0f;       // palette shift of the specular highlight
+    float half_x = 0.0f;      // halfway between the light and the eye
+    float half_y = 0.0f;
+    float half_z = 1.0f;
+    float shininess = 40.0f;
+    float glint_floor = 0.0f; // the highlight's value on a flat surface, taken off
+};
+
+// The Bulge relief at one pixel, from the blurred shape `s` and its gradient
+// (per render pixel). The shape is inflated like glass: 0 at the outline,
+// rising to 1 inside, with a profile between a soft cushion and a round rim.
+// Looking through it bends the gradient towards the inside where the surface
+// tilts (refraction), and shifts the palette by how much each wall faces the
+// light, by how steep it is, and by a specular highlight along the contour.
+// Returns the lookup offset in full-resolution pixels and the palette shift.
+COSMIC_HD void ReliefAt(float s, float s_dx, float s_dy, const ReliefShape& p, float* dx, float* dy, float* lift) {
+    // The blurred outline sits where s = 0.5; u runs from 0 there to 1 inside.
+    const float u = Clampf(2.0f * s - 1.0f, 0.0f, 1.0f);
+    const float gx = 2.0f * s_dx * p.inv_full_x;
+    const float gy = 2.0f * s_dy * p.inv_full_y;
+    const float length = sqrtf(gx * gx + gy * gy);
+    if (!(length > 1.0e-12f)) {
+        *dx = *dy = *lift = 0.0f;
+        return;
+    }
+    // Slope of the profile h(u): 1 for the cushion, (1 - u) / sqrt(u (2 - u))
+    // for the quarter circle, which is vertical at the outline.
+    const float q = sqrtf(Maxf(u * (2.0f - u), 1.0e-4f));
+    const float slope = 1.0f + ((1.0f - u) / q - 1.0f) * p.rounding;
+    const float g = p.height * slope * length;
+    const float tilt = g / sqrtf(1.0f + g * g);  // sine of the surface's tilt
+    const float ix = gx / length;                // inwards
+    const float iy = gy / length;
+    *dx = p.refraction * tilt * ix;
+    *dy = p.refraction * tilt * iy;
+    // A wall facing the light has its outward normal (-ix, -iy) towards it.
+    float l = -p.shade * tilt * (ix * p.light_x + iy * p.light_y) + p.rim * tilt * tilt;
+    if (p.glint > 0.0f) {
+        // Blinn highlight: a bright line along the contour where the surface
+        // turns halfway towards the light.
+        const float nz = sqrtf(Maxf(0.0f, 1.0f - tilt * tilt));
+        const float nh = Maxf(0.0f, -tilt * (ix * p.half_x + iy * p.half_y) + nz * p.half_z);
+        const float spec = powf(nh, p.shininess);
+        l += p.glint * Maxf(0.0f, spec - p.glint_floor) / (1.0f - p.glint_floor);
+    }
+    *lift = l;
+}
+
+// The blurred shape: levels lo and hi mixed.
+COSMIC_HD float BlurredShape(const float* lo, const float* hi, float mix, int w, int x, int y) {
+    const float a = lo[y * w + x];
+    return a + (hi[y * w + x] - a) * mix;
+}
+
+// The relief at pixel (x, y) of the levels' w x h domain, its slope from the
+// neighbouring pixels (one-sided at the domain's edges).
+COSMIC_HD void ReliefPixel(const float* lo, const float* hi, float mix, int w, int h, int x, int y,
+                           const ReliefShape& p, float* dx, float* dy, float* lift) {
+    const int xl = x > 0 ? x - 1 : 0;
+    const int xr = x < w - 1 ? x + 1 : w - 1;
+    const int yu = y > 0 ? y - 1 : 0;
+    const int yd = y < h - 1 ? y + 1 : h - 1;
+    const float s = BlurredShape(lo, hi, mix, w, x, y);
+    const float s_dx = xr > xl ? (BlurredShape(lo, hi, mix, w, xr, y) - BlurredShape(lo, hi, mix, w, xl, y)) /
+                                     static_cast<float>(xr - xl)
+                               : 0.0f;
+    const float s_dy = yd > yu ? (BlurredShape(lo, hi, mix, w, x, yd) - BlurredShape(lo, hi, mix, w, x, yu)) /
+                                     static_cast<float>(yd - yu)
+                               : 0.0f;
+    ReliefAt(s, s_dx, s_dy, p, dx, dy, lift);
 }
 
 // Palette lookup table: kLutSize linear-light colours, t in [0, 1].

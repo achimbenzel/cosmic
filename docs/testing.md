@@ -26,8 +26,10 @@ g++ -std=c++17 -O1 -g -fsanitize=thread -I src -I tests \
 
 `build/cosmic_preview <dir>` writes contact sheets of every palette, gradient
 type, depth shape, turbulence setting and repeat mode, text renders (defaults,
-focus, hot glow with and without highlight protection, inverted matte) and
-timings at 1080p and 4K. The mock host writes `mockhost_*.png` for each case.
+focus, hot glow with and without highlight protection, inverted matte, the
+Bulge variants) and timings at 1080p and 4K. `build/cosmic_preview <dir>
+layer.pgm` renders just the Bulge variants on your own layer (an 8-bit binary
+PGM used as the alpha). The mock host writes `mockhost_*.png` for each case.
 
 ## In After Effects
 
@@ -38,7 +40,7 @@ things only the real host can tell you.
    apply **Effect ▸ AB Tools ▸ Cosmic Gradient** to a text layer. No warning
    triangle in Effect Controls (that would mean After Effects does not consider
    the effect thread safe).
-2. **The right build.** The group before *Performance* is named `v1.1.0 (<commit>)`. After
+2. **The right build.** The last group is named `v1.2.0 (<commit>)`. After
    Effects scans both its own `Plug-ins` folder and
    `Common\Plug-ins\7.0\MediaCore`; a stale copy in the other one wins.
 3. **Palettes.** Pick each palette: the five colours update. Edit a colour: the
@@ -63,27 +65,37 @@ things only the real host can tell you.
     render concurrently without artefacts.
 13. **Stability.** Apply and remove the effect 20 times, undo/redo, duplicate
     the layer, save, reopen. Memory returns to where it was.
+14. **Bulge.** On bold text, Bulge 0 % is the flat gradient; 100 % inflates
+    the letters into glass with a lit side and a highlight along the contour.
+    Rounding 0 % softens the rim, Softness 40 % leaves flat tops, Light Angle
+    moves the lit side.
+15. **Moving content.** Turbulence 20 % on a text layer, then animate the text
+    across the frame (layer Position on a shape or text layer, a text
+    animator's Position, or a precomp that moves it). Played back, the
+    turbulence and the bulge travel with the letters; nothing flickers or
+    swims. Repeat at Half resolution.
 
 ### GPU (NVIDIA)
 
-14. **The GPU is used.** With *Project Settings ▸ Video Rendering and Effects ▸
+16. **The GPU is used.** With *Project Settings ▸ Video Rendering and Effects ▸
     Mercury GPU Acceleration (CUDA)*, the effect shows the GPU badge in the
     Effects & Presets panel, and scrubbing a defocused, turbulent 4K comp is
     clearly faster than with *Mercury Software Only*.
-15. **Same frame.** Render one frame with CUDA and one with Software Only and
+17. **Same frame.** Render one frame with CUDA and one with Software Only and
     difference them (a *Difference* blend of the two renders): black, apart
     from invisible rounding.
-16. **GPU Acceleration off.** *Performance ▸ GPU Acceleration* off renders that
+18. **GPU Acceleration off.** *Performance ▸ GPU Acceleration* off renders that
     instance on the CPU and still looks the same.
-17. **Bit depths on the GPU.** Repeat 15 in 8, 16 and 32 bpc. If a GPU render
+19. **Bit depths on the GPU.** Repeat 17 in 8, 16 and 32 bpc. If a GPU render
     is off in colour in 8 or 16 bpc, note it and set *Working Space* to sRGB.
-18. **Big frames.** A 6K or 8K comp with a large glow and defocus renders
+20. **Big frames.** A 6K or 8K comp with a large glow and defocus renders
     (falling back to the CPU if the card runs out of memory) rather than
     failing.
 
 ### Old projects
 
-19. **A v1.0 project.** Open a project saved with v1.0: every control shows the
-    value it was saved with, and the frames match v1.0's renders (only
-    full-frame layers may differ, very slightly, within a blur's reach of the
-    frame edge).
+21. **A v1.0 or v1.1 project.** Open a project saved with v1.0 or v1.1: every
+    control shows the value it was saved with (a v1.1 *Depth Shape: Bulge*
+    now reads *Lens*), Bulge is 0 %, and the frames match the old renders
+    except for the turbulence pattern, which now travels with the content,
+    and sub-pixel differences from the finer content bounds.

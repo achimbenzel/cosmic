@@ -89,8 +89,9 @@ FAKE_API int __stdcall cuModuleGetFunction(void** function, void* module, const 
     if (!ContextCurrent()) return kInvalidContext;
     if (module == nullptr || name == nullptr) return kInvalidValue;
     // Only names the emulator (and so the PTX) has.
-    static const char* const kKnown[] = {"CosmicBounds",   "CosmicWarpGrid", "CosmicBase",     "CosmicReduceH",
-                                         "CosmicReduceV",  "CosmicFocus",    "CosmicCollapse", "CosmicComposite"};
+    static const char* const kKnown[] = {"CosmicRowStats", "CosmicWarpGrid", "CosmicShape",   "CosmicSmooth",
+                                         "CosmicRelief",   "CosmicBase",     "CosmicReduceH", "CosmicReduceV",
+                                         "CosmicFocus",    "CosmicCollapse", "CosmicComposite"};
     for (const char* known : kKnown) {
         if (std::strcmp(known, name) == 0) {
             *function = new FakeFunction{name};  // lives as long as the process; a handful of bytes

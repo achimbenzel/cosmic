@@ -12,8 +12,11 @@
 namespace cosmic {
 
 enum class Kernel {
-    kBounds = 0,
+    kRowStats = 0,
     kWarpGrid,
+    kShape,
+    kSmooth,
+    kRelief,
     kBase,
     kReduceH,
     kReduceV,

@@ -154,8 +154,16 @@ int main() {
         {"conic_mirror", [](cosmic::UiValues& u) { u.gradient_type = 3; u.repeat = 3; u.cycles = 3; }},
         {"diamond_ridge", [](cosmic::UiValues& u) { u.gradient_type = 4; u.depth_shape = 3; }},
         {"reflected_wave", [](cosmic::UiValues& u) { u.gradient_type = 5; u.depth_shape = 4; u.depth_pct = 10; }},
-        {"bulge", [](cosmic::UiValues& u) { u.depth_shape = 5; u.depth_pct = 70; u.cycles = 3; u.repeat = 2; }},
-        {"pinch", [](cosmic::UiValues& u) { u.depth_shape = 5; u.depth_pct = -90; }},
+        {"lens", [](cosmic::UiValues& u) { u.depth_shape = 5; u.depth_pct = 70; u.cycles = 3; u.repeat = 2; }},
+        {"lens_pinch", [](cosmic::UiValues& u) { u.depth_shape = 5; u.depth_pct = -90; }},
+        {"bulge", [](cosmic::UiValues& u) { u.bulge_pct = 100; }},
+        {"bulge_cushion", [](cosmic::UiValues& u) {
+             u.bulge_pct = 150; u.rounding_pct = 0; u.softness_pct = 250; u.light_angle_deg = 120; u.contrast_pct = 100; }},
+        {"bulge_narrow", [](cosmic::UiValues& u) { u.bulge_pct = 200; u.softness_pct = 20; u.cycles = 2; u.repeat = 3; }},
+        {"bulge_inverted", [](cosmic::UiValues& u) { u.matte = 2; u.bulge_pct = 100; }},
+        {"bulge_full_frame", [](cosmic::UiValues& u) { u.matte = 3; u.bulge_pct = 80; u.turbulence_pct = 10; }},
+        {"bulge_no_expand", [](cosmic::UiValues& u) { u.expand_bounds = false; u.bulge_pct = 100; }},
+        {"bulge_half_res", [](cosmic::UiValues& u) { u.bulge_pct = 100; u.turbulence_pct = 8; u.defocus_px = 6; }, 2},
         {"focus", [](cosmic::UiValues& u) { u.defocus_px = 14; u.focus_radius_pct = 10; }},
         {"focus_hard", [](cosmic::UiValues& u) { u.defocus_px = 40; u.focus_radius_pct = 5; u.focus_falloff_pct = 0; }},
         {"hot_glow", [](cosmic::UiValues& u) { u.glow_intensity_pct = 300; u.glow_threshold = 0.1f; u.protection_pct = 80; }},
@@ -172,7 +180,7 @@ int main() {
         {"no_expand", [](cosmic::UiValues& u) { u.expand_bounds = false; }},
         {"half_res", [](cosmic::UiValues& u) { u.defocus_px = 12; u.turbulence_pct = 8; }, 2},
         {"everything", [](cosmic::UiValues& u) {
-             u.turbulence_pct = 12; u.depth_shape = 5; u.defocus_px = 20; u.grain_pct = 10; u.blend = 5;
+             u.turbulence_pct = 12; u.depth_shape = 5; u.bulge_pct = 120; u.defocus_px = 20; u.grain_pct = 10; u.blend = 5;
              u.glow_intensity_pct = 150; u.diffusion_pct = 60; u.working_space = 3; }},
     };
 

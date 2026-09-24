@@ -1,7 +1,6 @@
 #include "gpu/GpuPipeline.h"
 
 #include <algorithm>
-#include <climits>
 #include <cmath>
 #include <vector>
 
@@ -174,8 +173,11 @@ CosmicResult ToResult(Status status) {
 
 const char* KernelName(Kernel kernel) {
     switch (kernel) {
-        case Kernel::kBounds: return "CosmicBounds";
+        case Kernel::kRowStats: return "CosmicRowStats";
         case Kernel::kWarpGrid: return "CosmicWarpGrid";
+        case Kernel::kShape: return "CosmicShape";
+        case Kernel::kSmooth: return "CosmicSmooth";
+        case Kernel::kRelief: return "CosmicRelief";
         case Kernel::kBase: return "CosmicBase";
         case Kernel::kReduceH: return "CosmicReduceH";
         case Kernel::kReduceV: return "CosmicReduceV";
@@ -212,48 +214,133 @@ CosmicResult RenderCosmicGpu(const CosmicSettings& settings, const GpuRender& re
     if (lut_buffer == 0) return CosmicResult::kOutOfMemory;
     if (!device.Upload(lut_buffer, lut.Table(), sizeof(Rgb) * kLutSize)) return CosmicResult::kDeviceError;
 
-    // Reference box.
-    ReferenceBox box = BoxFromSourceBounds(settings, 0, -1, 0, -1, 0, 0, 1.0f, 1.0f);
-    if (WantsContentBounds(settings) && has_source) {
-        const DevicePtr bounds = buffers.Allocate(sizeof(int) * 4);
-        if (bounds == 0) return CosmicResult::kOutOfMemory;
-        int init[4] = {INT_MAX, -1, INT_MAX, -1};
-        if (!device.Upload(bounds, init, sizeof(init))) return CosmicResult::kDeviceError;
-        BoundsParams p;
+    // The layer's shape: content bounds and the relief's scale.
+    ShapeMeasure shape;
+    if (WantsShapeMeasure(settings) && has_source) {
+        const int rows = render.source.height;
+        const DevicePtr stats = buffers.Allocate(sizeof(RowStats) * static_cast<std::size_t>(rows));
+        if (stats == 0) return CosmicResult::kOutOfMemory;
+        RowStatsParams p;
         p.source = render.source.data;
-        p.out = bounds;
+        p.out = stats;
         p.width = render.source.width;
-        p.height = render.source.height;
+        p.height = rows;
         p.pitch = render.source.pitch;
+        p.measure_outline = settings.bulge > 0.0f ? 1 : 0;
         p.visible = kVisibleAlpha;
-        if (!Run(device, Kernel::kBounds, render.source.height, 1, p)) return CosmicResult::kDeviceError;
-        int found[4] = {0, -1, 0, -1};
-        if (!device.Finish() || !device.Download(found, bounds, sizeof(found))) return CosmicResult::kDeviceError;
-        box = BoxFromSourceBounds(settings, found[0], found[1], found[2], found[3], render.source_left,
-                                  render.source_top, render.to_full_x, render.to_full_y);
+        p.to_full_x = render.to_full_x;
+        p.to_full_y = render.to_full_y;
+        p.unused = 0.0f;
+        if (!Run(device, Kernel::kRowStats, rows, 1, p)) return CosmicResult::kDeviceError;
+        // Summed on the host in row order, like the CPU renderer does.
+        std::vector<RowStats> found(static_cast<std::size_t>(rows));
+        if (!device.Finish() || !device.Download(found.data(), stats, sizeof(RowStats) * found.size())) {
+            return CosmicResult::kDeviceError;
+        }
+        buffers.Release(stats);
+        shape = MeasureShape(found.data(), rows);
     }
+    const ReferenceBox box =
+        BoxFromShape(settings, shape, render.source_left, render.source_top, render.to_full_x, render.to_full_y);
 
     // Turbulence grid.
-    const WarpPlan warp = MakeWarpPlan(settings, box, render.blur_scale, width, height);
+    const WarpPlan warp =
+        MakeWarpPlan(settings, box, render.to_full_x, render.to_full_y, canvas_left, canvas_top, width, height);
     DevicePtr warp_buffer = 0;
     if (warp.active) {
-        warp_buffer = buffers.Allocate(sizeof(float) * 2 * static_cast<std::size_t>(warp.nx) * warp.ny);
+        warp_buffer = buffers.Allocate(sizeof(float) * 2 * static_cast<std::size_t>(warp.lattice.nx) *
+                                       static_cast<std::size_t>(warp.lattice.ny));
         if (warp_buffer == 0) return CosmicResult::kOutOfMemory;
         WarpGridParams p;
         p.out = warp_buffer;
-        p.nx = warp.nx;
-        p.ny = warp.ny;
-        p.step = warp.step;
-        p.canvas_left = canvas_left;
-        p.canvas_top = canvas_top;
-        p.to_full_x = render.to_full_x;
-        p.to_full_y = render.to_full_y;
-        p.inv_size = warp.inv_size;
+        p.lattice = warp.lattice;
         p.amount = warp.amount;
         p.evolution = warp.evolution;
         p.fbm = warp.fbm;
         p.fbm2 = warp.fbm2;
-        if (!Run(device, Kernel::kWarpGrid, warp.nx, warp.ny, p)) return CosmicResult::kDeviceError;
+        if (!Run(device, Kernel::kWarpGrid, warp.lattice.nx, warp.lattice.ny, p)) return CosmicResult::kDeviceError;
+    }
+
+    // 0. The Bulge relief. Level 0 of its pyramid is the shape; each level is
+    // filtered from the one before into `level`, except level lo, which goes
+    // to `kept` when level lo + 1 is needed as well.
+    DevicePtr relief = 0;
+    ReliefGeometry geometry;
+    geometry.canvas_left = canvas_left;
+    geometry.canvas_top = canvas_top;
+    geometry.width = width;
+    geometry.height = height;
+    geometry.source_left = render.source_left;
+    geometry.source_top = render.source_top;
+    geometry.source_width = has_source ? render.source.width : 0;
+    geometry.source_height = has_source ? render.source.height : 0;
+    geometry.to_full_x = render.to_full_x;
+    geometry.to_full_y = render.to_full_y;
+    geometry.blur_scale = render.blur_scale;
+    const ReliefPlan relief_plan = MakeReliefPlan(settings, box, shape, geometry);
+    if (relief_plan.active && has_source) {
+        const int dw = relief_plan.domain_width;
+        const int dh = relief_plan.domain_height;
+        const std::size_t plane = sizeof(float) * static_cast<std::size_t>(dw) * static_cast<std::size_t>(dh);
+        const bool two = relief_plan.hi > relief_plan.lo;
+        const DevicePtr level = buffers.Allocate(plane);
+        const DevicePtr tmp = buffers.Allocate(plane);
+        const DevicePtr kept = two ? buffers.Allocate(plane) : 0;
+        if (level == 0 || tmp == 0 || (two && kept == 0)) return CosmicResult::kOutOfMemory;
+
+        ShapeParams sp;
+        sp.source = render.source.data;
+        sp.out = level;
+        sp.source_width = render.source.width;
+        sp.source_height = render.source.height;
+        sp.source_pitch = render.source.pitch;
+        sp.source_left = render.source_left;
+        sp.source_top = render.source_top;
+        sp.width = dw;
+        sp.height = dh;
+        sp.canvas_left = canvas_left + relief_plan.domain_left;
+        sp.canvas_top = canvas_top + relief_plan.domain_top;
+        sp.invert = relief_plan.invert;
+        if (!Run(device, Kernel::kShape, dw, dh, sp)) return CosmicResult::kDeviceError;
+
+        DevicePtr src = level;
+        for (int k = 1; k <= relief_plan.hi; ++k) {
+            SmoothParams p;
+            p.src = src;
+            p.dst = tmp;
+            p.width = dw;
+            p.height = dh;
+            p.step = SmoothLevelStep(k);
+            p.vertical = 0;
+            p.border = static_cast<int>(border);
+            p.unused = 0;
+            if (!Run(device, Kernel::kSmooth, dw, dh, p)) return CosmicResult::kDeviceError;
+            p.src = tmp;
+            p.dst = (k == relief_plan.lo && two) ? kept : level;
+            p.vertical = 1;
+            if (!Run(device, Kernel::kSmooth, dw, dh, p)) return CosmicResult::kDeviceError;
+            src = p.dst;
+        }
+        buffers.Release(tmp);
+
+        relief = buffers.Images(width, height);
+        if (relief == 0) return CosmicResult::kOutOfMemory;
+        ReliefParams rp;
+        rp.lo = two ? kept : level;
+        rp.hi = level;
+        rp.out = relief;
+        rp.width = width;
+        rp.height = height;
+        rp.domain_left = relief_plan.domain_left;
+        rp.domain_top = relief_plan.domain_top;
+        rp.domain_width = dw;
+        rp.domain_height = dh;
+        rp.mix = relief_plan.mix;
+        rp.unused = 0.0f;
+        rp.shape = relief_plan.shape;
+        if (!Run(device, Kernel::kRelief, width, height, rp)) return CosmicResult::kDeviceError;
+        buffers.Release(level);
+        buffers.Release(kept);
     }
 
     // 1. The gradient, matted and blended with the layer.
@@ -265,6 +352,7 @@ CosmicResult RenderCosmicGpu(const CosmicSettings& settings, const GpuRender& re
         p.out = base;
         p.lut = lut_buffer;
         p.warp = warp_buffer;
+        p.relief = relief;
         p.source_width = render.source.width;
         p.source_height = render.source.height;
         p.source_pitch = render.source.pitch;
@@ -274,19 +362,18 @@ CosmicResult RenderCosmicGpu(const CosmicSettings& settings, const GpuRender& re
         p.height = height;
         p.canvas_left = canvas_left;
         p.canvas_top = canvas_top;
-        p.warp_nx = warp.nx;
-        p.warp_ny = warp.ny;
-        p.warp_step = warp.step;
         p.decode_srgb = linear ? 0 : 1;
         p.matte = static_cast<int>(settings.matte);
         p.blend = static_cast<int>(settings.blend);
         p.opacity = std::clamp(settings.opacity, 0.0f, 1.0f);
         p.to_full_x = render.to_full_x;
         p.to_full_y = render.to_full_y;
+        p.lattice = warp.lattice;
         p.field = MakeField(settings, box);
         if (!Run(device, Kernel::kBase, width, height, p)) return CosmicResult::kDeviceError;
     }
     buffers.Release(warp_buffer);
+    buffers.Release(relief);
 
     // 2. Focus.
     DevicePtr image = base;

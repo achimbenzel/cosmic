@@ -117,35 +117,117 @@ bool WantsContentBounds(const CosmicSettings& settings) {
     return settings.fit == FitMode::kContentBounds && settings.matte == MatteMode::kLayerAlpha;
 }
 
-ReferenceBox BoxFromSourceBounds(const CosmicSettings& settings, int x0, int x1, int y0, int y1, int source_left,
-                                 int source_top, float to_full_x, float to_full_y) {
+bool WantsShapeMeasure(const CosmicSettings& settings) {
+    return WantsContentBounds(settings) || settings.bulge > 0.0f;
+}
+
+ShapeMeasure MeasureShape(const RowStats* rows, int count) {
+    ShapeMeasure m;
+    int x0 = 0;
+    int x1 = -1;
+    int y0 = -1;
+    int y1 = -1;
+    double area = 0.0;
+    double outline = 0.0;
+    for (int y = 0; y < count; ++y) {
+        const RowStats& r = rows[y];
+        area += r.area;
+        outline += r.outline;
+        if (r.first < 0) continue;
+        if (y0 < 0) {
+            y0 = y;
+            x0 = r.first;
+            x1 = r.last;
+        }
+        y1 = y;
+        x0 = std::min(x0, r.first);
+        x1 = std::max(x1, r.last);
+    }
+    m.area = static_cast<float>(area);
+    m.outline = static_cast<float>(outline);
+    if (y0 < 0) return m;
+
+    // A vertical edge covering a fraction c of its column starts 1 - c into
+    // it; take the column's best-covered pixel as the edge's.
+    float a_left = 0.0f;
+    float a_right = 0.0f;
+    for (int y = y0; y <= y1; ++y) {
+        const RowStats& r = rows[y];
+        if (r.first == x0) a_left = std::max(a_left, r.alpha_first);
+        if (r.last == x1) a_right = std::max(a_right, r.alpha_last);
+    }
+    const float a_top = std::clamp(rows[y0].alpha_max, 0.0f, 1.0f);
+    const float a_bottom = std::clamp(rows[y1].alpha_max, 0.0f, 1.0f);
+    m.left = static_cast<float>(x0) + 1.0f - std::clamp(a_left, 0.0f, 1.0f);
+    m.right = static_cast<float>(x1) + std::clamp(a_right, 0.0f, 1.0f);
+    m.top = static_cast<float>(y0) + 1.0f - a_top;
+    m.bottom = static_cast<float>(y1) + a_bottom;
+    // Something thinner than a pixel: a pixel-wide box around it.
+    if (m.right - m.left < 1.0f) {
+        const float c = 0.5f * (m.left + m.right);
+        m.left = c - 0.5f;
+        m.right = c + 0.5f;
+    }
+    if (m.bottom - m.top < 1.0f) {
+        const float c = 0.5f * (m.top + m.bottom);
+        m.top = c - 0.5f;
+        m.bottom = c + 0.5f;
+    }
+    m.visible = true;
+    return m;
+}
+
+ReferenceBox LayerBox(const CosmicSettings& settings) {
     ReferenceBox layer;
     layer.width = settings.layer_width;
     layer.height = settings.layer_height;
-    if (x1 < x0 || y1 < y0) return layer;
+    return layer;
+}
+
+ReferenceBox BoxFromShape(const CosmicSettings& settings, const ShapeMeasure& shape, int source_left,
+                          int source_top, float to_full_x, float to_full_y) {
+    if (!WantsContentBounds(settings) || !shape.visible) return LayerBox(settings);
     ReferenceBox box;
-    box.x0 = static_cast<float>(x0 + source_left) * to_full_x;
-    box.y0 = static_cast<float>(y0 + source_top) * to_full_y;
-    box.width = static_cast<float>(x1 - x0 + 1) * to_full_x;
-    box.height = static_cast<float>(y1 - y0 + 1) * to_full_y;
+    box.x0 = (shape.left + static_cast<float>(source_left)) * to_full_x;
+    box.y0 = (shape.top + static_cast<float>(source_top)) * to_full_y;
+    box.width = (shape.right - shape.left) * to_full_x;
+    box.height = (shape.bottom - shape.top) * to_full_y;
     return box;
 }
 
-WarpPlan MakeWarpPlan(const CosmicSettings& s, const ReferenceBox& box, float blur_scale, int width, int height) {
+WarpPlan MakeWarpPlan(const CosmicSettings& s, const ReferenceBox& box, float to_full_x, float to_full_y,
+                      int canvas_left, int canvas_top, int width, int height) {
     WarpPlan plan;
     const float shorter = std::max(1.0f, std::min(box.width, box.height));
     const float turbulence = s.turbulence * shorter;
-    const float turbulence_size = s.turbulence_size * shorter;
-    plan.active = turbulence > 0.0f && turbulence_size > 0.0f;
+    const float size = s.turbulence_size * shorter;
+    plan.active = turbulence > 0.0f && size > 0.0f && width > 0 && height > 0;
     if (!plan.active) return plan;
-    // The noise is smooth at the scale asked for, so it is evaluated on a
-    // coarse grid a quarter of its finest octave apart.
-    const float size_render = turbulence_size * blur_scale;
-    const float finest = size_render / std::ldexp(1.0f, static_cast<int>(std::ceil(s.complexity)) - 1);
-    plan.step = std::clamp(static_cast<int>(finest * 0.25f), 1, 16);
-    plan.nx = width / plan.step + 5;
-    plan.ny = height / plan.step + 5;
-    plan.inv_size = 1.0f / turbulence_size;
+
+    // The noise is smooth at the scale asked for, so it is evaluated on nodes
+    // a quarter of its finest octave apart and reconstructed in between. The
+    // spacing is set in noise units, so the reconstruction is the same at any
+    // resolution; it only coarsens where nodes would be closer than a render
+    // pixel.
+    float spacing = 0.25f / std::ldexp(1.0f, static_cast<int>(std::ceil(s.complexity)) - 1);
+    const float render_pixel = std::max(to_full_x, to_full_y);
+    for (int k = 0; k < 64 && spacing * size < render_pixel; ++k) spacing *= 2.0f;
+
+    WarpLattice& l = plan.lattice;
+    l.spacing = spacing;
+    l.anchor_x = box.x0 + 0.5f * box.width;
+    l.anchor_y = box.y0 + 0.5f * box.height;
+    l.scale = 1.0f / (size * spacing);
+    // Cover the canvas with the B-spline's reach and a node to spare.
+    const float gx0 = WarpGridCoordinate(0, canvas_left, to_full_x, l.anchor_x, l.scale, 0);
+    const float gx1 = WarpGridCoordinate(width - 1, canvas_left, to_full_x, l.anchor_x, l.scale, 0);
+    const float gy0 = WarpGridCoordinate(0, canvas_top, to_full_y, l.anchor_y, l.scale, 0);
+    const float gy1 = WarpGridCoordinate(height - 1, canvas_top, to_full_y, l.anchor_y, l.scale, 0);
+    l.origin_i = static_cast<int>(std::floor(gx0)) - 2;
+    l.origin_j = static_cast<int>(std::floor(gy0)) - 2;
+    l.nx = static_cast<int>(std::floor(gx1)) + 4 - l.origin_i;
+    l.ny = static_cast<int>(std::floor(gy1)) + 4 - l.origin_j;
+
     // Fractal noise sits well inside [-1, 1]; this brings its typical swing up
     // to about the displacement asked for.
     plan.amount = turbulence * 1.6f;
@@ -154,6 +236,87 @@ WarpPlan MakeWarpPlan(const CosmicSettings& s, const ReferenceBox& box, float bl
     plan.fbm.seed = Hash32(s.seed * 0x9e3779b9u + 0x85ebca6bu);
     plan.fbm2 = plan.fbm;
     plan.fbm2.seed = Hash32(plan.fbm.seed ^ 0x5bd1e995u);
+    return plan;
+}
+
+float SmoothLevelSigma(int level) {
+    if (level <= 0) return 0.0f;
+    // Each level adds the B3-spline's variance, 1, times its spread squared.
+    return std::sqrt((std::ldexp(1.0f, 2 * level) - 1.0f) / 3.0f);
+}
+
+ReliefPlan MakeReliefPlan(const CosmicSettings& s, const ReferenceBox& box, const ShapeMeasure& shape,
+                          const ReliefGeometry& g) {
+    ReliefPlan plan;
+    if (!(s.bulge > 0.0f) || !shape.visible || !(shape.area > 0.0f) || !(shape.outline > 0.0f)) return plan;
+    if (g.width <= 0 || g.height <= 0 || g.source_width <= 0 || g.source_height <= 0) return plan;
+    const float to_full_x = g.to_full_x;
+    const float to_full_y = g.to_full_y;
+    const float blur_scale = g.blur_scale;
+
+    // Twice the area over the outline is a stroke's width, for text and
+    // anything else made of strokes: the relief's scale, so it fits bold and
+    // thin type alike and grows with the shape.
+    const float longer = std::max(1.0f, std::max(box.width, box.height));
+    const float stroke = std::clamp(2.0f * shape.area / shape.outline, 1.0f, 4.0f * longer);
+    const float rise = std::max(0.5f, s.bulge_softness * stroke * 0.5f);  // full-resolution pixels
+
+    // Blurred by half the rise, the outline's 0.5 contour ramps up to 0.95
+    // over the rise.
+    const float sigma = std::max(0.5f * rise * blur_scale, SmoothLevelSigma(1));
+    int lo = 1;
+    while (lo < kMaxReliefLevels && SmoothLevelSigma(lo + 1) <= sigma) ++lo;
+    float mix = 0.0f;
+    if (lo < kMaxReliefLevels) {
+        const float s_lo = SmoothLevelSigma(lo);
+        const float s_hi = SmoothLevelSigma(lo + 1);
+        mix = std::clamp((sigma - s_lo) / (s_hi - s_lo), 0.0f, 1.0f);
+    }
+    plan.lo = lo;
+    plan.mix = mix;
+    plan.hi = mix > 0.0f ? lo + 1 : lo;
+
+    // The pyramid's reach: each level's filter spans two taps of its step
+    // either side.
+    const int reach = 2 * ((1 << plan.hi) - 1);
+    const int source_x = g.source_left - g.canvas_left;
+    const int source_y = g.source_top - g.canvas_top;
+    const int left = std::min(0, std::max(source_x - reach, -kMaxReliefMargin));
+    const int top = std::min(0, std::max(source_y - reach, -kMaxReliefMargin));
+    const int right = std::max(g.width, std::min(source_x + g.source_width + reach, g.width + kMaxReliefMargin));
+    const int bottom = std::max(g.height, std::min(source_y + g.source_height + reach, g.height + kMaxReliefMargin));
+    plan.domain_left = left;
+    plan.domain_top = top;
+    plan.domain_width = right - left;
+    plan.domain_height = bottom - top;
+    plan.invert = s.matte == MatteMode::kInvertedAlpha ? 1 : 0;
+
+    ReliefShape& r = plan.shape;
+    r.inv_full_x = 1.0f / to_full_x;
+    r.inv_full_y = 1.0f / to_full_y;
+    r.height = rise;
+    r.rounding = std::clamp(s.rounding, 0.0f, 1.0f);
+    const float shorter = std::max(1.0f, std::min(box.width, box.height));
+    r.refraction = s.bulge * kReliefRefraction * shorter;
+    r.shade = s.bulge * std::max(0.0f, s.contrast) * kReliefShade;
+    r.rim = s.bulge * kReliefRim;
+    r.light_x = std::sin(s.light_angle);
+    r.light_y = -std::cos(s.light_angle);
+    // The light stands kLightElevation above the surface, the eye straight on.
+    const float ce = std::cos(kLightElevation);
+    const float se = std::sin(kLightElevation);
+    float hx = r.light_x * ce;
+    float hy = r.light_y * ce;
+    float hz = se + 1.0f;
+    const float hn = std::sqrt(hx * hx + hy * hy + hz * hz);
+    r.half_x = hx / hn;
+    r.half_y = hy / hn;
+    r.half_z = hz / hn;
+    r.shininess = kGlintShininess;
+    r.glint_floor = std::pow(r.half_z, r.shininess);
+    r.glint = s.bulge * std::max(0.0f, s.contrast) * kReliefGlint;
+    if (!(r.glint_floor < 0.999f)) r.glint = 0.0f;
+    plan.active = true;
     return plan;
 }
 

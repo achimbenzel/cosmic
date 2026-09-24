@@ -10,9 +10,11 @@
 namespace cosmic {
 namespace {
 
-// Parameter ids are how After Effects finds a parameter's saved value when a
-// project is reopened, so they must never change once shipped. They match the
-// indices of the first release; anything new takes the next free number.
+// Disk ids: how After Effects finds a parameter's saved value when a project
+// is reopened, whatever position the parameter has now. An id must never
+// change or be reused once shipped; anything new takes the next free number.
+// v1.0's ids equal its positions; later versions insert parameters where they
+// belong in the panel, with new ids.
 enum ParamId {
     kIdPaletteGroup = 1,
     kIdPalette = 2,
@@ -83,27 +85,68 @@ enum ParamId {
     // v1.1
     kIdPerformanceGroup = 67,
     kIdGpu = 68,
-    kIdPerformanceGroupEnd = 69
+    kIdPerformanceGroupEnd = 69,
+    // v1.2
+    kIdBulge = 70,
+    kIdRounding = 71,
+    kIdSoftness = 72,
+    kIdLightAngle = 73,
+    kIdContrast = 74
 };
 
-static_assert(kParamCount == 70, "parameters may only be appended");
-static_assert(kParamColor5 - kParamColor1 == kStopCount - 1, "one colour control per palette stop");
-static_assert(kParamWorkingSpace == 63 && kIdWorkingSpace == 63, "layout of the first release");
-static_assert(kParamAboutGroupEnd == 66 && kIdAboutGroupEnd == 66, "layout of the first release");
-static_assert(kParamDepthShape == 22 && kIdDepthShape == 22 && kParamLoopWithAngle == 32 &&
-                  kIdLoopWithAngle == 32,
-              "layout of the first release");
-static_assert(kParamGpu == 68 && kIdGpu == 68 && kParamPerformanceGroupEnd == 69 && kIdPerformanceGroupEnd == 69,
-              "layout of v1.1");
+// The id at each position, in the order SetupParams adds them.
+constexpr int kIdAt[kParamCount] = {
+    0,  // the input layer, which After Effects adds
+    kIdPaletteGroup, kIdPalette, kIdColor1, kIdColor2, kIdColor3, kIdColor4, kIdColor5, kIdColorBlend,
+    kIdReverse, kIdPaletteGroupEnd,
+    kIdGradientGroup, kIdType, kIdFit, kIdCenter, kIdAngle, kIdSize, kIdCycles, kIdOffset, kIdRepeat,
+    kIdGradientGroupEnd,
+    kIdDepthGroup, kIdDepthShape, kIdDepth, kIdDepthCenter, kIdDepthRadius, kIdBulge, kIdRounding, kIdSoftness,
+    kIdLightAngle, kIdContrast, kIdDepthGroupEnd,
+    kIdTurbulenceGroup, kIdTurbulence, kIdTurbulenceSize, kIdComplexity, kIdEvolution, kIdLoopWithAngle, kIdSeed,
+    kIdTurbulenceGroupEnd,
+    kIdFocusGroup, kIdFocusPoint, kIdFocusRadius, kIdFocusFalloff, kIdDefocus, kIdFocusGroupEnd,
+    kIdGlowGroup, kIdGlowIntensity, kIdGlowRadius, kIdGlowFalloff, kIdGlowThreshold, kIdGlowSoftness,
+    kIdHighlightProtection, kIdGlowGroupEnd,
+    kIdDiffusionGroup, kIdDiffusion, kIdDiffusionRadius, kIdDiffusionGroupEnd,
+    kIdGrainGroup, kIdGrain, kIdGrainSize, kIdAnimateGrain, kIdGrainGroupEnd,
+    kIdCompositeGroup, kIdMatte, kIdBlend, kIdOpacity, kIdExpandBounds, kIdWorkingSpace, kIdCompositeGroupEnd,
+    kIdPerformanceGroup, kIdGpu, kIdPerformanceGroupEnd,
+    kIdAboutGroup, kIdAboutGroupEnd,
+};
 
-// Popup strings. Their order is the enums' order in CosmicPipeline.h and
-// Palette.h, so it is part of the project format too: append only.
+// Every id exactly once, and each position holding the id its name says.
+constexpr bool IdsAreUnique() {
+    for (int i = 1; i < kParamCount; ++i) {
+        if (kIdAt[i] < 1 || kIdAt[i] > 9999) return false;
+        for (int j = i + 1; j < kParamCount; ++j) {
+            if (kIdAt[i] == kIdAt[j]) return false;
+        }
+    }
+    return true;
+}
+static_assert(IdsAreUnique(), "disk ids must be unique and in 1..9999");
+static_assert(kIdAt[kParamPalette] == kIdPalette && kIdAt[kParamColor5] == kIdColor5 &&
+                  kIdAt[kParamDepthShape] == kIdDepthShape && kIdAt[kParamDepthRadius] == kIdDepthRadius &&
+                  kIdAt[kParamBulge] == kIdBulge && kIdAt[kParamContrast] == kIdContrast &&
+                  kIdAt[kParamDepthGroupEnd] == kIdDepthGroupEnd && kIdAt[kParamTurbulence] == kIdTurbulence &&
+                  kIdAt[kParamLoopWithAngle] == kIdLoopWithAngle && kIdAt[kParamDefocus] == kIdDefocus &&
+                  kIdAt[kParamGlowIntensity] == kIdGlowIntensity && kIdAt[kParamAnimateGrain] == kIdAnimateGrain &&
+                  kIdAt[kParamMatte] == kIdMatte && kIdAt[kParamWorkingSpace] == kIdWorkingSpace &&
+                  kIdAt[kParamGpu] == kIdGpu && kIdAt[kParamAboutGroupEnd] == kIdAboutGroupEnd,
+              "ParamIndex and kIdAt disagree");
+static_assert(kParamColor5 - kParamColor1 == kStopCount - 1, "one colour control per palette stop");
+
+// Popup strings. Their order is the enums' order in Shared.h, CosmicPipeline.h
+// and Palette.h, and a popup saves its position, so it is part of the project
+// format too: append only (renaming an entry is fine).
 constexpr char kColorBlendChoices[] = "Oklab Smooth|Oklab|Linear Light|sRGB";
 constexpr char kTypeChoices[] = "Linear|Radial|Conic|Diamond|Reflected";
 constexpr char kFitChoices[] = "Content Bounds|Layer";
 constexpr char kRepeatChoices[] = "None|Repeat|Mirror";
-// "Bulge" was appended in v1.1; the first four keep their v1.0 positions.
-constexpr char kDepthShapeChoices[] = "Dome|Sphere|Ridge|Wave|Bulge";
+// The fifth, appended in v1.1 as "Bulge", is the lens: Bulge is now the
+// relief control.
+constexpr char kDepthShapeChoices[] = "Dome|Sphere|Ridge|Wave|Lens";
 constexpr char kMatteChoices[] = "Layer Alpha|Inverted Alpha|Full Frame";
 constexpr char kBlendChoices[] = "Normal|Multiply|Screen|Overlay|Color";
 constexpr char kWorkingSpaceChoices[] = "Auto|Linear|sRGB";
@@ -230,6 +273,17 @@ PF_Err SetupParams(PF_InData* in_data, PF_OutData* out_data) {
     PF_ADD_POINT("Depth Center", kDefaultDepthCenterPct[0], kDefaultDepthCenterPct[1], FALSE, kIdDepthCenter);
     PF_ADD_FLOAT_SLIDERX("Depth Radius", 1.0f, 2000.0f, 5.0f, 200.0f, d.depth_radius_pct, PF_Precision_TENTHS,
                          PF_ValueDisplayFlag_PERCENT, 0, kIdDepthRadius);
+    // v1.2: the layer's own shape raised into a glass relief.
+    PF_ADD_FLOAT_SLIDERX("Bulge", 0.0f, 400.0f, 0.0f, 200.0f, d.bulge_pct, PF_Precision_TENTHS,
+                         PF_ValueDisplayFlag_PERCENT, 0, kIdBulge);
+    PF_ADD_FLOAT_SLIDERX("Rounding", 0.0f, 100.0f, 0.0f, 100.0f, d.rounding_pct, PF_Precision_TENTHS,
+                         PF_ValueDisplayFlag_PERCENT, 0, kIdRounding);
+    PF_ADD_FLOAT_SLIDERX("Softness", 1.0f, 1000.0f, 10.0f, 400.0f, d.softness_pct, PF_Precision_TENTHS,
+                         PF_ValueDisplayFlag_PERCENT, 0, kIdSoftness);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_ANGLE("Light Angle", d.light_angle_deg, kIdLightAngle);
+    PF_ADD_FLOAT_SLIDERX("Contrast", 0.0f, 400.0f, 0.0f, 200.0f, d.contrast_pct, PF_Precision_TENTHS,
+                         PF_ValueDisplayFlag_PERCENT, 0, kIdContrast);
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(kIdDepthGroupEnd);
 
@@ -312,19 +366,19 @@ PF_Err SetupParams(PF_InData* in_data, PF_OutData* out_data) {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(kIdCompositeGroupEnd);
 
+    // --- Performance ------------------------------------------------------
+    PF_ADD_TOPICX("Performance", PF_ParamFlag_START_COLLAPSED, kIdPerformanceGroup);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("GPU Acceleration", d.gpu ? TRUE : FALSE, 0, kIdGpu);
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(kIdPerformanceGroupEnd);
+
     // An empty group whose header is the build, so the loaded build can be
     // identified without leaving the panel.
     PF_ADD_TOPICX("v" COSMIC_VERSION_STRING " (" COSMIC_BUILD_ID ")", PF_ParamFlag_START_COLLAPSED,
                   kIdAboutGroup);
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(kIdAboutGroupEnd);
-
-    // --- Performance (v1.1, appended after the v1.0 layout) -----------------
-    PF_ADD_TOPICX("Performance", PF_ParamFlag_START_COLLAPSED, kIdPerformanceGroup);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOXX("GPU Acceleration", d.gpu ? TRUE : FALSE, 0, kIdGpu);
-    AEFX_CLR_STRUCT(def);
-    PF_END_TOPIC(kIdPerformanceGroupEnd);
 
     out_data->num_params = kParamCount;
     return PF_Err_NONE;
@@ -352,6 +406,11 @@ PF_Err ReadParams(PF_InData* in_data, EffectParams* out_params) {
     if (!err) err = ReadFloat(in_data, kParamDepth, &ui.depth_pct);
     if (!err) err = ReadPoint(in_data, kParamDepthCenter, &ui.depth_x, &ui.depth_y);
     if (!err) err = ReadFloat(in_data, kParamDepthRadius, &ui.depth_radius_pct);
+    if (!err) err = ReadFloat(in_data, kParamBulge, &ui.bulge_pct);
+    if (!err) err = ReadFloat(in_data, kParamRounding, &ui.rounding_pct);
+    if (!err) err = ReadFloat(in_data, kParamSoftness, &ui.softness_pct);
+    if (!err) err = ReadAngle(in_data, kParamLightAngle, &ui.light_angle_deg);
+    if (!err) err = ReadFloat(in_data, kParamContrast, &ui.contrast_pct);
 
     if (!err) err = ReadFloat(in_data, kParamTurbulence, &ui.turbulence_pct);
     if (!err) err = ReadFloat(in_data, kParamTurbulenceSize, &ui.turbulence_size_pct);

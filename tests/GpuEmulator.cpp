@@ -7,23 +7,6 @@
 #include <thread>
 #include <vector>
 
-namespace {
-
-std::mutex g_atomic_mutex;
-
-}  // namespace
-
-// The kernels' atomics, for the one kernel (CosmicBounds) that uses them.
-inline void EmulatorAtomicMin(int* ptr, int value) {
-    std::lock_guard<std::mutex> lock(g_atomic_mutex);
-    if (value < *ptr) *ptr = value;
-}
-
-inline void EmulatorAtomicMax(int* ptr, int value) {
-    std::lock_guard<std::mutex> lock(g_atomic_mutex);
-    if (value > *ptr) *ptr = value;
-}
-
 #include "gpu/CosmicKernels.cu"
 
 namespace cosmic_test {
@@ -38,8 +21,11 @@ void Run(const void* params, int x, int y) {
 
 const std::map<std::string, Runner>& Kernels() {
     static const std::map<std::string, Runner> table = {
-        {"CosmicBounds", &Run<cosmic::BoundsParams, CosmicBounds>},
+        {"CosmicRowStats", &Run<cosmic::RowStatsParams, CosmicRowStats>},
         {"CosmicWarpGrid", &Run<cosmic::WarpGridParams, CosmicWarpGrid>},
+        {"CosmicShape", &Run<cosmic::ShapeParams, CosmicShape>},
+        {"CosmicSmooth", &Run<cosmic::SmoothParams, CosmicSmooth>},
+        {"CosmicRelief", &Run<cosmic::ReliefParams, CosmicRelief>},
         {"CosmicBase", &Run<cosmic::BaseParams, CosmicBase>},
         {"CosmicReduceH", &Run<cosmic::ReduceParams, CosmicReduceH>},
         {"CosmicReduceV", &Run<cosmic::ReduceParams, CosmicReduceV>},

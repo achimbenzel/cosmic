@@ -64,6 +64,11 @@ CosmicSettings SettingsFromUi(const UiValues& ui, float layer_width, float layer
     s.depth_x = ui.depth_x;
     s.depth_y = ui.depth_y;
     s.depth_radius = std::max(0.01f, ui.depth_radius_pct) * 0.01f;
+    s.bulge = std::max(0.0f, ui.bulge_pct) * 0.01f;
+    s.rounding = std::clamp(ui.rounding_pct * 0.01f, 0.0f, 1.0f);
+    s.bulge_softness = std::max(1.0f, ui.softness_pct) * 0.01f;
+    s.light_angle = ui.light_angle_deg * kDegToRad;
+    s.contrast = std::max(0.0f, ui.contrast_pct) * 0.01f;
 
     s.turbulence = std::max(0.0f, ui.turbulence_pct) * 0.01f;
     s.turbulence_size = std::max(0.1f, ui.turbulence_size_pct) * 0.01f;

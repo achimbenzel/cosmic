@@ -87,4 +87,38 @@ private:
     ImageF view_;
 };
 
+// Owns a buffer of single floats obtained from an Allocator.
+class OwnedFloats {
+public:
+    OwnedFloats() = default;
+    ~OwnedFloats() { Release(); }
+
+    OwnedFloats(const OwnedFloats&) = delete;
+    OwnedFloats& operator=(const OwnedFloats&) = delete;
+
+    bool Allocate(Allocator& allocator, std::size_t count) {
+        Release();
+        if (count == 0) return false;
+        void* memory = allocator.Allocate(count * sizeof(float));
+        if (memory == nullptr) return false;
+        allocator_ = &allocator;
+        data_ = static_cast<float*>(memory);
+        return true;
+    }
+
+    void Release() {
+        if (allocator_ != nullptr && data_ != nullptr) allocator_->Free(data_);
+        allocator_ = nullptr;
+        data_ = nullptr;
+    }
+
+    float* Data() { return data_; }
+    const float* Data() const { return data_; }
+    bool Valid() const { return data_ != nullptr; }
+
+private:
+    Allocator* allocator_ = nullptr;
+    float* data_ = nullptr;
+};
+
 }  // namespace cosmic

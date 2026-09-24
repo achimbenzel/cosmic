@@ -19,36 +19,33 @@ struct FrameBGRA {
     float b, g, r, a;
 };
 
-struct BoundsParams {
+// One thread per row of the layer, each filling that row's RowStats.
+struct RowStatsParams {
     DevicePtr source;  // FrameBGRA
-    DevicePtr out;     // int[4]: x0, x1, y0, y1
+    DevicePtr out;     // RowStats[height]
     int width;
     int height;
     int pitch;
+    int measure_outline;
     float visible;
+    float to_full_x;
+    float to_full_y;
+    float unused;
 };
 
 struct WarpGridParams {
-    DevicePtr out;  // float pairs, nx * ny
-    int nx;
-    int ny;
-    int step;
-    int canvas_left;
-    int canvas_top;
-    float to_full_x;
-    float to_full_y;
-    float inv_size;
+    DevicePtr out;  // float pairs, lattice.nx * lattice.ny
+    WarpLattice lattice;
     float amount;
     float evolution;
     FbmSettings fbm;
     FbmSettings fbm2;
 };
 
-struct BaseParams {
-    DevicePtr source;  // FrameBGRA, 0 when there is no layer
-    DevicePtr out;     // PixelF, width x height
-    DevicePtr lut;     // Rgb[kLutSize]
-    DevicePtr warp;    // WarpGridParams::out, 0 when inactive
+// The shape the relief is raised from, on the canvas: level 0 of its pyramid.
+struct ShapeParams {
+    DevicePtr source;  // FrameBGRA
+    DevicePtr out;     // float, width x height
     int source_width;
     int source_height;
     int source_pitch;
@@ -58,15 +55,59 @@ struct BaseParams {
     int height;
     int canvas_left;
     int canvas_top;
-    int warp_nx;
-    int warp_ny;
-    int warp_step;
+    int invert;
+};
+
+// One pass of a level of the relief's pyramid (SmoothAt).
+struct SmoothParams {
+    DevicePtr src;  // float, width x height
+    DevicePtr dst;  // float, width x height
+    int width;
+    int height;
+    int step;
+    int vertical;
+    int border;
+    int unused;
+};
+
+// The relief from two levels of the shape's pyramid.
+struct ReliefParams {
+    DevicePtr lo;   // float, domain_width x domain_height
+    DevicePtr hi;   // float, the same (and the same buffer as lo when mix is 0)
+    DevicePtr out;  // PixelF, width x height: a = palette shift, r, g = lookup offset
+    int width;      // the canvas
+    int height;
+    int domain_left;  // the levels' domain, in canvas pixels
+    int domain_top;
+    int domain_width;
+    int domain_height;
+    float mix;
+    float unused;
+    ReliefShape shape;
+};
+
+struct BaseParams {
+    DevicePtr source;  // FrameBGRA, 0 when there is no layer
+    DevicePtr out;     // PixelF, width x height
+    DevicePtr lut;     // Rgb[kLutSize]
+    DevicePtr warp;    // WarpGridParams::out, 0 when inactive
+    DevicePtr relief;  // ReliefParams::out, 0 when inactive
+    int source_width;
+    int source_height;
+    int source_pitch;
+    int source_left;
+    int source_top;
+    int width;
+    int height;
+    int canvas_left;
+    int canvas_top;
     int decode_srgb;
     int matte;  // MatteMode
     int blend;  // BlendMode
     float opacity;
     float to_full_x;
     float to_full_y;
+    WarpLattice lattice;
     Field field;
 };
 

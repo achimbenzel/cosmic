@@ -15,15 +15,10 @@
 #define COSMIC_KERNEL(name, Params) extern "C" __global__ void name(const Params p)
 #define COSMIC_X static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x)
 #define COSMIC_Y static_cast<int>(blockIdx.y * blockDim.y + threadIdx.y)
-#define COSMIC_ATOMIC_MIN(ptr, value) atomicMin(ptr, value)
-#define COSMIC_ATOMIC_MAX(ptr, value) atomicMax(ptr, value)
 #else
-// The emulator supplies EmulatorAtomicMin/Max before including this file.
 #define COSMIC_KERNEL(name, Params) inline void name(const Params& p, int cosmic_x, int cosmic_y)
 #define COSMIC_X cosmic_x
 #define COSMIC_Y cosmic_y
-#define COSMIC_ATOMIC_MIN(ptr, value) EmulatorAtomicMin(ptr, value)
-#define COSMIC_ATOMIC_MAX(ptr, value) EmulatorAtomicMax(ptr, value)
 #endif
 
 namespace cosmic {
@@ -78,6 +73,18 @@ COSMIC_HD PixelF SampleScaled(const PixelF* image, int w, int h, int scale_log2,
     return acc;
 }
 
+// The layer's alpha for MeasureRow.
+struct FrameAlpha {
+    const FrameBGRA* data;
+    int width;
+    int height;
+    int pitch;
+    COSMIC_HD float At(int x, int y) const {
+        if (x < 0 || y < 0 || x >= width || y >= height) return 0.0f;
+        return Clampf(data[y * pitch + x].a, 0.0f, 1.0f);
+    }
+};
+
 COSMIC_HD PixelF FromFrame(const FrameBGRA& f) {
     PixelF p;
     p.a = f.a;
@@ -91,35 +98,20 @@ COSMIC_HD PixelF FromFrame(const FrameBGRA& f) {
 }  // namespace cosmic
 
 // ---------------------------------------------------------------------------
-// Content bounds: one thread per row finds the row's first and last visible
-// pixel and folds them into out[4] = {x0, x1, y0, y1}.
+// The layer's shape, measured row by row: one thread per row.
 // ---------------------------------------------------------------------------
-COSMIC_KERNEL(CosmicBounds, cosmic::BoundsParams) {
+COSMIC_KERNEL(CosmicRowStats, cosmic::RowStatsParams) {
     using namespace cosmic;
     const int y = COSMIC_X;
     (void)COSMIC_Y;  // a one-dimensional launch
     if (y >= p.height) return;
-    const FrameBGRA* row = kernels::Ptr<const FrameBGRA>(p.source) + y * p.pitch;
-    int first = -1;
-    for (int x = 0; x < p.width; ++x) {
-        if (row[x].a > p.visible) {
-            first = x;
-            break;
-        }
-    }
-    if (first < 0) return;
-    int last = first;
-    for (int x = p.width - 1; x > first; --x) {
-        if (row[x].a > p.visible) {
-            last = x;
-            break;
-        }
-    }
-    int* out = kernels::Ptr<int>(p.out);
-    COSMIC_ATOMIC_MIN(&out[0], first);
-    COSMIC_ATOMIC_MAX(&out[1], last);
-    COSMIC_ATOMIC_MIN(&out[2], y);
-    COSMIC_ATOMIC_MAX(&out[3], y);
+    kernels::FrameAlpha alpha;
+    alpha.data = kernels::Ptr<const FrameBGRA>(p.source);
+    alpha.width = p.width;
+    alpha.height = p.height;
+    alpha.pitch = p.pitch;
+    kernels::Ptr<RowStats>(p.out)[y] =
+        MeasureRow(alpha, y, p.width, p.visible, p.measure_outline, p.to_full_x, p.to_full_y);
 }
 
 // ---------------------------------------------------------------------------
@@ -129,9 +121,60 @@ COSMIC_KERNEL(CosmicWarpGrid, cosmic::WarpGridParams) {
     using namespace cosmic;
     const int i = COSMIC_X;
     const int j = COSMIC_Y;
-    if (i >= p.nx || j >= p.ny) return;
-    WarpNode(i, j, p.step, p.canvas_left, p.canvas_top, p.to_full_x, p.to_full_y, p.inv_size, p.amount, p.evolution,
-             p.fbm, p.fbm2, kernels::Ptr<float>(p.out) + (j * p.nx + i) * 2);
+    if (i >= p.lattice.nx || j >= p.lattice.ny) return;
+    WarpNode(i, j, p.lattice, p.amount, p.evolution, p.fbm, p.fbm2,
+             kernels::Ptr<float>(p.out) + (j * p.lattice.nx + i) * 2);
+}
+
+// ---------------------------------------------------------------------------
+// The shape the Bulge relief is raised from, on the canvas.
+// ---------------------------------------------------------------------------
+COSMIC_KERNEL(CosmicShape, cosmic::ShapeParams) {
+    using namespace cosmic;
+    const int cx = COSMIC_X;
+    const int cy = COSMIC_Y;
+    if (cx >= p.width || cy >= p.height) return;
+    float a = 0.0f;
+    const int sy = p.canvas_top + cy - p.source_top;
+    const int sx = p.canvas_left + cx - p.source_left;
+    if (sy >= 0 && sy < p.source_height && sx >= 0 && sx < p.source_width) {
+        a = kernels::Ptr<const FrameBGRA>(p.source)[sy * p.source_pitch + sx].a;
+    }
+    kernels::Ptr<float>(p.out)[cy * p.width + cx] = ShapeValue(a, p.invert);
+}
+
+// ---------------------------------------------------------------------------
+// One pass of a level of the relief's pyramid.
+// ---------------------------------------------------------------------------
+COSMIC_KERNEL(CosmicSmooth, cosmic::SmoothParams) {
+    using namespace cosmic;
+    const int x = COSMIC_X;
+    const int y = COSMIC_Y;
+    if (x >= p.width || y >= p.height) return;
+    kernels::Ptr<float>(p.dst)[y * p.width + x] =
+        SmoothAt(kernels::Ptr<const float>(p.src), p.width, p.height, x, y, p.step, p.vertical,
+                 static_cast<BorderMode>(p.border));
+}
+
+// ---------------------------------------------------------------------------
+// The Bulge relief: lookup offsets and palette shifts.
+// ---------------------------------------------------------------------------
+COSMIC_KERNEL(CosmicRelief, cosmic::ReliefParams) {
+    using namespace cosmic;
+    const int cx = COSMIC_X;
+    const int cy = COSMIC_Y;
+    if (cx >= p.width || cy >= p.height) return;
+    float dx = 0.0f;
+    float dy = 0.0f;
+    float lift = 0.0f;
+    ReliefPixel(kernels::Ptr<const float>(p.lo), kernels::Ptr<const float>(p.hi), p.mix, p.domain_width,
+                p.domain_height, cx - p.domain_left, cy - p.domain_top, p.shape, &dx, &dy, &lift);
+    PixelF o;
+    o.a = lift;
+    o.r = dx;
+    o.g = dy;
+    o.b = 0.0f;
+    kernels::Ptr<PixelF>(p.out)[cy * p.width + cx] = o;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,13 +214,23 @@ COSMIC_KERNEL(CosmicBase, cosmic::BaseParams) {
     float x = (static_cast<float>(p.canvas_left + cx) + 0.5f) * p.to_full_x;
     float y = (static_cast<float>(ly) + 0.5f) * p.to_full_y;
     if (p.warp != 0) {
+        const WarpLattice& l = p.lattice;
         float wx = 0.0f;
         float wy = 0.0f;
-        SampleWarp(kernels::Ptr<const float>(p.warp), p.warp_nx, p.warp_ny, p.warp_step, cx, cy, &wx, &wy);
+        SampleWarp(kernels::Ptr<const float>(p.warp), l.nx, l.ny,
+                   WarpGridCoordinate(cx, p.canvas_left, p.to_full_x, l.anchor_x, l.scale, l.origin_i),
+                   WarpGridCoordinate(cy, p.canvas_top, p.to_full_y, l.anchor_y, l.scale, l.origin_j), &wx, &wy);
         x += wx;
         y += wy;
     }
-    Rgb color = SampleLut(kernels::Ptr<const Rgb>(p.lut), FieldValue(p.field, x, y));
+    float lift = 0.0f;
+    if (p.relief != 0) {
+        const PixelF rv = kernels::Ptr<const PixelF>(p.relief)[cy * p.width + cx];
+        x += rv.r;
+        y += rv.g;
+        lift = rv.a;
+    }
+    Rgb color = SampleLut(kernels::Ptr<const Rgb>(p.lut), FieldValue(p.field, x, y, lift));
     if (static_cast<BlendMode>(p.blend) != BlendMode::kNormal) {
         const float inv = src.a > kTransparent ? 1.0f / src.a : 0.0f;
         Rgb s;

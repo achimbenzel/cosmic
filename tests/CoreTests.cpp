@@ -53,6 +53,20 @@ TestImage MakeDisc(int width, int height, PixelDepth depth) {
     return image;
 }
 
+// A disc of radius r centred on (cx, cy), anti-aliased by its exact distance,
+// so a sub-pixel move changes the coverage the way a rasteriser's would.
+TestImage MakeDiscAt(int width, int height, float cx, float cy, float r) {
+    TestImage image(width, height, PixelDepth::kFloat32);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float d = std::sqrt((x + 0.5f - cx) * (x + 0.5f - cx) + (y + 0.5f - cy) * (y + 0.5f - cy));
+            const float a = std::clamp(r - d + 0.5f, 0.0f, 1.0f);
+            image.SetPixel(x, y, PixelF{a, a, a, a});
+        }
+    }
+    return image;
+}
+
 struct Output {
     TestImage image;
     int expansion = 0;
@@ -372,6 +386,37 @@ void TestResolutionIndependence() {
     Check(mean < 0.01, Fmt("mean difference %.5f", mean));
 }
 
+void TestBulgeResolutionIndependence() {
+    std::printf("bulge: Half resolution matches Full\n");
+    const int w = 320;
+    const int h = 200;
+    cosmic::UiValues ui = Plain(w, h);
+    ui.grain_pct = 0.0f;
+    ui.bulge_pct = 150.0f;
+    const TestImage disc_full = MakeDisc(w, h, PixelDepth::kFloat32);
+    const TestImage disc_half = MakeDisc(w / 2, h / 2, PixelDepth::kFloat32);
+    const Output full = Render(ui, &disc_full, w, h, PixelDepth::kFloat32, 1, false);
+    const Output half = Render(ui, &disc_half, w, h, PixelDepth::kFloat32, 2, false);
+    TestImage reduced(w / 2, h / 2, PixelDepth::kFloat32);
+    for (int y = 0; y < h / 2; ++y) {
+        for (int x = 0; x < w / 2; ++x) {
+            PixelF acc{0, 0, 0, 0};
+            for (int j = 0; j < 2; ++j) {
+                for (int i = 0; i < 2; ++i) {
+                    const PixelF p = full.image.GetPixel(2 * x + i, 2 * y + j);
+                    acc.a += p.a * 0.25f;
+                    acc.r += p.r * 0.25f;
+                    acc.g += p.g * 0.25f;
+                    acc.b += p.b * 0.25f;
+                }
+            }
+            reduced.SetPixel(x, y, acc);
+        }
+    }
+    const double mean = MeanDifference(reduced, half.image, 2);
+    Check(mean < 0.01, Fmt("mean difference %.5f", mean));
+}
+
 void TestContentBounds() {
     std::printf("geometry: content bounds put the palette's ends on the content's edges\n");
     cosmic::UiValues ui = Plain(1000, 500);
@@ -427,12 +472,12 @@ void TestRepeatModes() {
           "Mirror folds back");
 }
 
-void TestBulge() {
-    std::printf("geometry: bulge magnifies inside its radius and leaves the rest alone\n");
+void TestLens() {
+    std::printf("geometry: the lens magnifies inside its radius and leaves the rest alone\n");
     cosmic::UiValues ui = Plain(1000, 1000);
     ui.fit = 2;
     ui.angle_deg = 90.0f;  // left to right
-    ui.depth_shape = 5;
+    ui.depth_shape = 5;  // Lens
     ui.depth_x = 500.0f;
     ui.depth_y = 500.0f;
     ui.depth_radius_pct = 20.0f;  // 200 px
@@ -462,6 +507,170 @@ void TestBulge() {
         }
     }
     Check(monotonic, "no fold-over at extreme depths");
+}
+
+// Everything that is not about the content itself off: grain and focus are
+// tied to the layer, and the glow's pyramid to the canvas grid.
+cosmic::UiValues Still(int width, int height) {
+    cosmic::UiValues ui = Plain(width, height);
+    ui.grain_pct = 0.0f;
+    ui.glow_intensity_pct = 0.0f;
+    ui.diffusion_pct = 0.0f;
+    return ui;
+}
+
+// Largest difference between a's pixels and b's `dx`, `dy` further on, over
+// the pixels of `a` where the matte is solid.
+double ShiftedDifference(const TestImage& a, const TestImage& b, int dx, int dy) {
+    double worst = 0.0;
+    for (int y = 0; y < a.View().height; ++y) {
+        for (int x = 0; x < a.View().width; ++x) {
+            const int bx = x + dx;
+            const int by = y + dy;
+            if (bx < 0 || by < 0 || bx >= b.View().width || by >= b.View().height) continue;
+            const PixelF p = a.GetPixel(x, y);
+            if (p.a < 0.999f) continue;
+            const PixelF q = b.GetPixel(bx, by);
+            worst = std::max({worst, (double)std::fabs(p.r - q.r), (double)std::fabs(p.g - q.g),
+                              (double)std::fabs(p.b - q.b), (double)std::fabs(p.a - q.a)});
+        }
+    }
+    return worst;
+}
+
+void TestTurbulenceTravelsWithContent() {
+    std::printf("motion: turbulence travels with the content instead of the content sliding through it\n");
+    const int w = 400;
+    const int h = 300;
+    cosmic::UiValues ui = Still(w, h);
+    ui.turbulence_pct = 25.0f;
+    ui.turbulence_size_pct = 30.0f;
+    ui.complexity = 4.0f;
+    const TestImage here = MakeDiscAt(w, h, 150.0f, 130.0f, 70.0f);
+    const TestImage there = MakeDiscAt(w, h, 150.0f + 83.0f, 130.0f + 41.0f, 70.0f);
+    const Output a = Render(ui, &here, w, h, PixelDepth::kFloat32, 1, false);
+    const Output b = Render(ui, &there, w, h, PixelDepth::kFloat32, 1, false);
+    const double moved = ShiftedDifference(a.image, b.image, 83, 41);
+    Check(moved < 2.0e-3, Fmt("the moved disc looks the same (max difference %.2e)", moved));
+
+    // Nor does the canvas around the content matter: a larger output rect
+    // (Expand Bounds, glow reach) leaves the pixels inside alone.
+    ui.glow_intensity_pct = 0.0f;
+    const Output tight = Render(ui, &here, w, h, PixelDepth::kFloat32, 1, false);
+    TestImage wide_image(w + 50, h + 30, PixelDepth::kFloat32);
+    {
+        const cosmic::CosmicSettings settings =
+            cosmic::SettingsFromUi(ui, static_cast<float>(w), static_cast<float>(h), 0);
+        cosmic::CosmicRender render;
+        render.source = here.View();
+        render.dest = wide_image.View();
+        render.dest_left = -20;
+        render.dest_top = -10;
+        cosmic_test::MallocAllocator allocator;
+        cosmic_test::ThreadPoolRunner runner(4);
+        Check(cosmic::RenderCosmic(settings, render, allocator, runner) == cosmic::CosmicResult::kOk,
+              "wider canvas renders");
+    }
+    const double canvas = ShiftedDifference(tight.image, wide_image, 20, 10);
+    Check(canvas < 1.0e-5, Fmt("a wider canvas changes nothing inside (max difference %.2e)", canvas));
+}
+
+void TestSubPixelBounds() {
+    std::printf("motion: content bounds follow a sub-pixel move smoothly\n");
+    const int w = 200;
+    const int h = 120;
+    const cosmic::CosmicSettings fit = cosmic::SettingsFromUi(Plain(w, h), static_cast<float>(w),
+                                                              static_cast<float>(h), 0);
+    float worst = 0.0f;
+    for (int step = 0; step <= 20; ++step) {
+        const float offset = step * 0.1f;
+        const TestImage disc = MakeDiscAt(w, h, 80.3f + offset, 60.0f + 0.5f * offset, 30.0f);
+        cosmic::CosmicRender render;
+        render.source = disc.View();
+        const cosmic::ReferenceBox box = cosmic::FindReferenceBox(fit, render);
+        worst = std::max(worst, std::fabs(box.x0 - (50.3f + offset)));
+        worst = std::max(worst, std::fabs(box.y0 - (30.0f + 0.5f * offset)));
+        worst = std::max(worst, std::fabs(box.width - 60.0f));
+    }
+    Check(worst < 0.15f, Fmt("bounds within %.3f px of the disc's (want < 0.15)", worst));
+}
+
+void TestBulgeRelief() {
+    std::printf("bulge: a relief raised from the layer's shape\n");
+    const int w = 320;
+    const int h = 240;
+    const TestImage disc = MakeDiscAt(w, h, 160.0f, 120.0f, 90.0f);
+    cosmic::UiValues ui = Still(w, h);
+    ui.depth_pct = 0.0f;
+    // A long grey ramp that is almost flat over the disc, so what changes is
+    // the relief's palette shift.
+    cosmic::ApplyPreset(&ui, 13);
+    for (int k = 0; k < cosmic::kStopCount; ++k) {
+        const std::uint8_t v = static_cast<std::uint8_t>(20 + k * 50);
+        ui.colors[k][0] = ui.colors[k][1] = ui.colors[k][2] = v;
+    }
+    ui.size_pct = 2000.0f;
+    const Output flat = Render(ui, &disc, w, h, PixelDepth::kFloat32, 1, false);
+    ui.bulge_pct = 100.0f;
+    ui.light_angle_deg = -45.0f;  // from the top left
+    const Output raised = Render(ui, &disc, w, h, PixelDepth::kFloat32, 1, false);
+    Check(raised.result == cosmic::CosmicResult::kOk && raised.allocations == raised.frees, "renders and frees");
+
+    // The disc is thick: its middle stays flat, its rim tilts.
+    const PixelF middle_flat = flat.image.GetPixel(160, 120);
+    const PixelF middle = raised.image.GetPixel(160, 120);
+    Check(std::fabs(middle.g - middle_flat.g) < 0.02f,
+          Fmt("the plateau is left alone (%.4f vs %.4f)", middle.g, middle_flat.g));
+    const float d = 90.0f * 0.8f / std::sqrt(2.0f);
+    const PixelF lit = raised.image.GetPixel(static_cast<int>(160 - d), static_cast<int>(120 - d));
+    const PixelF shaded = raised.image.GetPixel(static_cast<int>(160 + d), static_cast<int>(120 + d));
+    Check(lit.g > middle.g + 0.02f && shaded.g < middle.g - 0.02f,
+          Fmt("the rim facing the light is brighter (%.3f), the far rim darker (%.3f)", lit.g, shaded.g));
+
+    // Moving the shape moves the relief with it, by odd amounts too, where a
+    // decimating pyramid would see the shape on a different grid - also close
+    // to the canvas's edge, where the relief's blur reaches past it.
+    {
+        const TestImage moved = MakeDiscAt(w, h, 160.0f + 13.0f, 120.0f + 7.0f, 90.0f);
+        const Output raised_moved = Render(ui, &moved, w, h, PixelDepth::kFloat32, 1, false);
+        const double shift = ShiftedDifference(raised.image, raised_moved.image, 13, 7);
+        Check(shift < 1.0e-4, Fmt("near the canvas's edge (max difference %.2e)", shift));
+    }
+    {
+        const int lw = 480;
+        const int lh = 400;
+        cosmic::UiValues m = ui;
+        cosmic::PlaceDefaultPoints(&m, static_cast<float>(lw), static_cast<float>(lh));
+        m.size_pct = 2000.0f;
+        const TestImage here = MakeDiscAt(lw, lh, 200.0f, 180.0f, 60.0f);
+        const TestImage there = MakeDiscAt(lw, lh, 200.0f + 13.0f, 180.0f + 7.0f, 60.0f);
+        const Output a = Render(m, &here, lw, lh, PixelDepth::kFloat32, 1, false);
+        const Output b = Render(m, &there, lw, lh, PixelDepth::kFloat32, 1, false);
+        const double shift = ShiftedDifference(a.image, b.image, 13, 7);
+        Check(shift < 1.0e-4, Fmt("and the relief moves with the shape (max difference %.2e)", shift));
+    }
+
+    // Bulge 0 is exactly the flat gradient.
+    ui.bulge_pct = 0.0f;
+    const Output zero = Render(ui, &disc, w, h, PixelDepth::kFloat32, 1, false);
+    Check(MaxDifference(zero.image, flat.image) == 0.0, "Bulge 0 changes nothing");
+
+    // Every matte, both roundings, at half resolution too.
+    bool ok = true;
+    for (int matte = 1; matte <= 3; ++matte) {
+        for (int ds = 1; ds <= 2; ++ds) {
+            cosmic::UiValues v = Plain(w, h);
+            v.matte = matte;
+            v.bulge_pct = 150.0f;
+            v.rounding_pct = ds == 1 ? 100.0f : 0.0f;
+            v.turbulence_pct = 10.0f;
+            v.defocus_px = 6.0f;
+            const TestImage layer = MakeDiscAt(w / ds, h / ds, 160.0f / ds, 120.0f / ds, 90.0f / ds);
+            const Output out = Render(v, &layer, w, h, PixelDepth::kBits16, ds, true);
+            ok = ok && out.result == cosmic::CosmicResult::kOk && out.allocations == out.frees;
+        }
+    }
+    Check(ok, "every matte and resolution renders and frees");
 }
 
 void TestDefaults() {
@@ -578,7 +787,10 @@ int main() {
     TestPyramidSigma();
     TestContentBounds();
     TestRepeatModes();
-    TestBulge();
+    TestLens();
+    TestSubPixelBounds();
+    TestTurbulenceTravelsWithContent();
+    TestBulgeRelief();
     TestDefaults();
     TestSeamlessLoopRender();
     TestBitDepthsAgree();
@@ -586,6 +798,7 @@ int main() {
     TestOpacityZeroIsPassThrough();
     TestGlowConservesLight();
     TestResolutionIndependence();
+    TestBulgeResolutionIndependence();
     TestNoBanding();
     TestFullFrameEdges();
     TestMemoryBalanceAndOptions();

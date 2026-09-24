@@ -35,6 +35,13 @@ struct UiValues {
     float depth_x = 0.0f;
     float depth_y = 0.0f;
     float depth_radius_pct = 40.0f;  // of the reference box's longer side
+    // Bulge (v1.2). Softness is relative to the shape's typical stroke: 100%
+    // raises a stroke all the way to its middle.
+    float bulge_pct = 0.0f;
+    float rounding_pct = 100.0f;
+    float softness_pct = 100.0f;
+    float light_angle_deg = -45.0f;
+    float contrast_pct = 50.0f;
 
     // Turbulence, both relative to the reference box's shorter side.
     float turbulence_pct = 5.0f;
